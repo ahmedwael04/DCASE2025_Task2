@@ -3,9 +3,9 @@ submission:
   # Submission label
   label: Kret_CU_task2_1
   # Submission name
-  name: BEATs-Large KNN Detector
+  name: FIRST-SHOT UNSUPERVISED ANOMALOUS SOUND DETECTION WITH FINE-TUNED HUBERT AND K-NEAREST NEIGHBORS
   # Abbreviated name (≤10 chars)
-  abbreviation: BEATsKNN
+  abbreviation: HuBERT-kNN
   # Authors
   authors:
     - firstname: Meghan
@@ -24,7 +24,7 @@ system:
     data_augmentation: none
     front_end: !!null
     acoustic_features: raw waveform
-    embeddings: BEATs-Large
+    embeddings: HuBERT
     machine_learning_method: k-NN
     aggregation_method: average
     domain_adaptation_method: fine-tuning
