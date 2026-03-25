@@ -5,6 +5,7 @@ This script is **optional** because the BEATs wrapper transforms audio on the fl
 """
 import argparse
 from pathlib import Path
+import torch
 import torchaudio
 from tqdm import tqdm
 
@@ -12,11 +13,15 @@ from tqdm import tqdm
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dcase_root", required=True)
-    ap.add_argument("--out_dir", default="logmel")
+    ap.add_argument(
+        "--out_dir",
+        default=None,
+        help="Output directory for cached mel tensors. Default: <dcase_root>/melspec",
+    )
     args = ap.parse_args()
 
     root = Path(args.dcase_root)
-    out_root = Path(args.out_dir)
+    out_root = Path(args.out_dir) if args.out_dir is not None else (root / "melspec")
     out_root.mkdir(parents=True, exist_ok=True)
 
     mel_spec = torchaudio.transforms.MelSpectrogram(
@@ -31,7 +36,7 @@ def main():
         mel = mel_spec(waveform).log1p()
         out_path = out_root / wav.relative_to(root).with_suffix(".pt")
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        torchaudio.save(out_path, mel, 16000)
+        torch.save(mel.cpu(), out_path)
 
 if __name__ == "__main__":
     main()

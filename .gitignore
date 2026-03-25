@@ -3,8 +3,13 @@ __pycache__/
 *.ipynb
 .env
 .venv/
+asd_env/
+env/
+venv/
 .cache/
 results/
 logs/
 data
 logmel
+pip_download/
+*.whl

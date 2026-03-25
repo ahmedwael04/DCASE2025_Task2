@@ -11,6 +11,6 @@ dependencies:
   - numpy
   - tqdm
   - pyyaml
-  - soundfile
+  - pysoundfile
   - matplotlib
   - pip
