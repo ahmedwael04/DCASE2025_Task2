@@ -6,11 +6,18 @@ Usage:
 """
 
 import argparse, glob, os
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch, torchaudio
+import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
+
+# Allow running as: python scripts/compute_dev_metrics.py
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from src.utils.file_utils     import load_config
 from src.models.beats_backbone import BEATsBackbone
@@ -28,8 +35,13 @@ def compute_metrics(cfg_path: str):
         Path(cfg["logging"]["bank_out"]) / "memory_bank.pt",
         map_location=device
     )
-    detector = KNNDetector(k=cfg["model"]["k"])
-    detector.fit(bank_ckpt["memory"])
+    k = cfg.get("detector", {}).get("k", cfg.get("model", {}).get("k", 3))
+    detector = KNNDetector(k=k)
+    normalize = bool(cfg.get("model", {}).get("normalize", False))
+    bank_mem = bank_ckpt["memory"]
+    if normalize:
+        bank_mem = [F.normalize(x, dim=-1) for x in bank_mem]
+    detector.fit(bank_mem)
 
     # 3) locate dev_data test files
     root = Path(cfg["data"]["root"]) / "dev_data" / "raw"
@@ -54,6 +66,8 @@ def compute_metrics(cfg_path: str):
             if wav.shape[0] > 1:
                 wav = wav.mean(dim=0, keepdim=True)
             feat  = backbone(wav.to(device), sr)
+            if normalize:
+                feat = F.normalize(feat, dim=-1)
             score = float(detector.score(feat.cpu()))
 
             if "_source_test_" in f:

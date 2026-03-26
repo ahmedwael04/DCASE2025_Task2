@@ -4,10 +4,17 @@ Build k-NN memory bank for DCASE-2025 Task-2.
 """
 
 import argparse
+import sys
 from pathlib import Path
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+# Allow running as: python scripts/train_knn.py
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from src.utils.file_utils import load_config
 from src.data.dcase_dataset import DCASETask2Dataset
@@ -43,12 +50,16 @@ def main():
         use_layer_stack=cfg["model"].get("use_layer_stack", False),
     ).to(device).eval()
 
-    detector = KNNDetector(k=cfg["model"]["k"])
+    k = cfg.get("detector", {}).get("k", cfg.get("model", {}).get("k", 3))
+    detector = KNNDetector(k=k)
+    normalize = bool(cfg.get("model", {}).get("normalize", False))
 
     feats, paths = [], []
     for batch in tqdm(loader, desc="Extracting embeddings"):
         wav, sr, path = batch[0]
         feat = backbone(wav.to(device), sr)
+        if normalize:
+            feat = F.normalize(feat, dim=-1)
         feats.append(feat.cpu())
         paths.append(path)
 

@@ -11,8 +11,14 @@ under your csv_out_dir (configs/default.yaml).
 import argparse, sys, glob
 from pathlib import Path
 
+# Allow running as: python scripts/infer.py
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import numpy as np
 import torch, torchaudio
+import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from src.utils.file_utils      import load_config
@@ -39,7 +45,11 @@ def main():
     # 4) Build GPU mem_bank of shape (N_train, D)
     mem_bank = torch.stack([x.squeeze(0) for x in raw_mem], dim=0).to(device)
     N, D = mem_bank.shape
-    K   = cfg["model"]["k"]
+    K = cfg.get("detector", {}).get("k", cfg.get("model", {}).get("k", 3))
+    distance = str(cfg.get("detector", {}).get("distance", "cosine")).lower()
+    normalize = bool(cfg.get("model", {}).get("normalize", False))
+    if normalize:
+        mem_bank = F.normalize(mem_bank, dim=-1)
 
     # 5) Compute decision threshold on GPU in chunks
     print("▶ Computing threshold distances on GPU…")
@@ -52,7 +62,10 @@ def main():
                   dynamic_ncols=True):
         sub = mem_bank[i : i+chunk]           # (chunk, D)
         # full pairwise distances (chunk, N)
-        d = torch.cdist(sub, mem_bank)        # GPU
+        if distance == "cosine":
+            d = 1.0 - (sub @ mem_bank.T)
+        else:
+            d = torch.cdist(sub, mem_bank)        # GPU
         # ignore self-dist: set diagonal in each row-block to large value
         for j in range(d.size(0)):
             global_idx = i + j
@@ -91,9 +104,14 @@ def main():
 
         # backbone→embedding (1, D)
         feat = backbone(wav, sr)
+        if normalize:
+            feat = F.normalize(feat, dim=-1)
 
         # GPU k‐NN scoring
-        d    = torch.cdist(feat, mem_bank)            # (1, N)
+        if distance == "cosine":
+            d = 1.0 - (feat @ mem_bank.T)
+        else:
+            d = torch.cdist(feat, mem_bank)            # (1, N)
         topk = torch.topk(d, k=K, dim=1, largest=False).values  # (1, K)
         score = float(topk.mean().item())
         decision = 1 if score > threshold else 0
