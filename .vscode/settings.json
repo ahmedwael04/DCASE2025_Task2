@@ -1,4 +1,22 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:system",
-    "python-envs.pythonProjects": []
+    "python-envs.pythonProjects": [],
+    "files.exclude": {
+        "results/csv/*BandSealer*.csv": true,
+        "results/csv/*CoffeeGrinder*.csv": true,
+        "results/csv/*HomeCamera*.csv": true,
+        "results/csv/*Polisher*.csv": true,
+        "results/csv/*ScrewFeeder*.csv": true,
+        "results/csv/*ToyPet*.csv": true,
+        "results/csv/*ToyRCCar*.csv": true
+    },
+    "search.exclude": {
+        "results/csv/*BandSealer*.csv": true,
+        "results/csv/*CoffeeGrinder*.csv": true,
+        "results/csv/*HomeCamera*.csv": true,
+        "results/csv/*Polisher*.csv": true,
+        "results/csv/*ScrewFeeder*.csv": true,
+        "results/csv/*ToyPet*.csv": true,
+        "results/csv/*ToyRCCar*.csv": true
+    }
 }
