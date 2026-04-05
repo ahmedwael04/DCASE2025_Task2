@@ -10,12 +10,7 @@ under your csv_out_dir (configs/default.yaml).
 
 import argparse, sys, glob
 from pathlib import Path
-
-# Allow running as: python scripts/infer.py
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
+import random
 import numpy as np
 import torch, torchaudio
 import torch.nn.functional as F
@@ -24,12 +19,22 @@ from tqdm.auto import tqdm
 from src.utils.file_utils      import load_config
 from src.models.beats_backbone import BEATsBackbone
 
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 def main():
     # 1) Argparse & config
     p = argparse.ArgumentParser()
     p.add_argument("--config", default="configs/default.yaml")
     args   = p.parse_args()
     cfg    = load_config(args.config)
+    set_seed(int(cfg.get("seed", 42)))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # 2) Paths

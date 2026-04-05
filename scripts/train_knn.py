@@ -2,7 +2,8 @@
 """
 Build k-NN memory bank for DCASE-2025 Task-2.
 """
-
+import random
+import numpy as np
 import argparse
 import sys
 from pathlib import Path
@@ -10,6 +11,15 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 # Allow running as: python scripts/train_knn.py
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +42,7 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    set_seed(int(cfg.get("seed", 42)))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     root = cfg["data"]["root"]

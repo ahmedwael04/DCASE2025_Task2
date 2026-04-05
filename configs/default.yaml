@@ -15,6 +15,8 @@ data:
   use_eval_normals: true
 
 
+seed: 19122004
+
 train:
   batch_size: 16       # same value you put in dataloader.batch_size
   num_workers: 2       # same as dataloader.num_workers
