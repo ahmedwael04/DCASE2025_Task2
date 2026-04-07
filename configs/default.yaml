@@ -14,12 +14,6 @@ data:
   # the memory bank?  (true = include them, false = ignore)
   use_eval_normals: true
 
-
-<<<<<<< HEAD
-seed: 42
-
-=======
->>>>>>> parent of 23c91c7 (Seed)
 train:
   batch_size: 16       # same value you put in dataloader.batch_size
   num_workers: 2       # same as dataloader.num_workers
