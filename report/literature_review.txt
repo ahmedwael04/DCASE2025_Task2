@@ -1,0 +1,148 @@
+LITERATURE REVIEW
+DCASE 2025 Task 2: First-shot Unsupervised Anomalous Sound Detection for Machine Condition Monitoring
+(With context for the HuBERT/BEATs + k-NN embedding-distance baseline implemented in this repository)
+
+1. Introduction: anomalous sound detection in industrial monitoring
+Anomalous sound detection (ASD) aims to identify abnormal machine conditions using audio signals recorded during machine operation. In practical condition monitoring, true failures are rare, diverse, and expensive to capture, which makes supervised learning difficult and motivates unsupervised or semi-supervised formulations. As a result, much of the ASD literature focuses on modeling normal operation and detecting deviations at inference time.
+
+Audio-based monitoring is appealing because microphones are inexpensive, non-contact sensors and can capture failure signatures that may be subtle or not easily measured by other modalities. However, ASD in the real world faces strong distribution shifts: changes in operating speed or load, changes in microphone placement or hardware, and changes in background noise (e.g., different factory environments). These shifts can degrade methods that assume the training and test distributions are stationary.
+
+In response, the DCASE challenge series has provided standardized datasets and evaluation protocols for ASD. DCASE 2025 Task 2 continues this line of work and emphasizes “first-shot” detection under domain shift, where systems are expected to generalize to new machine types without per-machine hyperparameter tuning.
+
+2. DCASE 2025 Task 2 context: first-shot UASD and domain shift
+DCASE 2025 Task 2 is framed as first-shot unsupervised anomalous sound detection (UASD) for machine condition monitoring under domain generalization constraints. In the first-shot setting, systems cannot rely on tuning hyperparameters on the target test distribution, because the evaluation includes machine types that differ from those in the development data. This pushes participants toward methods that are robust “out of the box” across machines and recording conditions.
+
+The task formalizes domain shift via source and target domains. These domains may differ in operating conditions and background noise characteristics (e.g., speed, load, microphone variations, different ambient noise, and signal-to-noise ratio). Importantly, the system should detect anomalies regardless of these shifts.
+
+The task also introduces optional supplementary data that may include clean machine recordings or noise-only recordings. This reflects a realistic factory scenario: sometimes one can capture ambient noise with the machine stopped, or clean normal operation in a quieter environment, even if the primary training data is noisy. A strong ASD approach should be able to exploit such data when available, but still operate when it is not.
+
+2.1 Dataset structure (high level)
+The DCASE 2025 Task 2 dataset is organized by machine type and “section” (a subset used for metric calculation). For development, each machine section provides normal training clips and normal/anomalous test clips, with domain labels (source/target) available for development and additional training data. The evaluation set withholds labels and, in addition, can hide domain and attribute information.
+
+2.2 Metrics and evaluation priorities
+The primary metrics are area under the ROC curve (AUC) and partial AUC (pAUC), where pAUC emphasizes performance at low false-positive rates. The task uses pAUC over the low-FPR range up to p = 0.1, reflecting an operational preference: frequent false alarms reduce trust and usability, so performance at low FPR is particularly important.
+
+The official system score aggregates AUC and pAUC values via a harmonic mean across machine types, sections, and domains. This aggregation penalizes methods that perform well on some conditions but fail badly on others, aligning with the task’s emphasis on robustness.
+
+2.3 Baseline systems and their assumptions
+The organizer baseline for Task 2 follows a classic reconstruction-based anomaly detection approach. It extracts log-mel spectrogram features, builds frame-level vectors using a context window, and trains an autoencoder to minimize reconstruction error on normal data. At inference time, reconstruction error serves as the anomaly score. A variant uses a Mahalanobis metric on reconstruction error with statistics estimated from normal data.
+
+Reconstruction-based baselines are intuitive and accessible, but they can be sensitive to domain shift and background noise. Under strong noise changes, models may reconstruct noise characteristics rather than machine condition, or may treat novel but normal background noise as anomalous.
+
+3. Representation learning for robust audio ASD
+A recurring theme in modern ASD is that the quality of the representation strongly influences detector robustness. If the representation captures stable factors related to machine condition while suppressing nuisance variation (e.g., noise type), then simple detectors can become surprisingly effective.
+
+Historically, many ASD systems used hand-crafted features such as mel spectrograms or MFCCs combined with autoencoders, Gaussian mixture models, or one-class SVMs. These representations are generic and often require careful tuning and additional robustness techniques (data augmentation, domain generalization losses, or post-hoc calibration).
+
+More recently, self-supervised learning (SSL) has become a powerful approach for learning general-purpose audio representations. SSL pretraining leverages large unlabeled corpora, producing embeddings that transfer to many downstream tasks with limited labeled data. For ASD, SSL embeddings can be used either (1) as fixed features with a lightweight anomaly detector or (2) as initialization for further adaptation (fine-tuning) on the target domain.
+
+4. Self-supervised transformer backbones for audio embeddings
+Transformer-based SSL backbones have become a central tool for extracting embeddings from raw waveforms. They typically learn contextualized representations using masking and prediction objectives or contrastive losses.
+
+4.1 wav2vec 2.0 and cross-lingual pretraining (XLSR)
+wav2vec 2.0 introduced a framework for learning speech representations from raw audio by quantizing latent representations and predicting masked segments, typically using a contrastive objective with a Transformer context network. The learned features transfer effectively to speech recognition and other speech-related tasks.
+
+XLSR (cross-lingual speech representations) extends this approach to multilingual or cross-domain settings, emphasizing that large-scale pretraining can produce representations that generalize across languages and recording conditions. Although these models are speech-focused, their architectures and learned representations are often reused for broader audio processing, including non-speech domains.
+
+4.2 HuBERT
+HuBERT (Hidden-Unit BERT) addresses a core challenge in speech SSL: defining suitable training targets without labels. It uses an offline clustering step to generate discrete “hidden unit” labels and trains a BERT-like masked prediction model to predict these units for masked regions. A key idea is that the model can learn useful structure as long as the clustering labels are reasonably consistent, even if not semantically perfect.
+
+HuBERT is relevant for ASD because it provides contextualized embeddings that can serve as stable features across noise and operating shifts. Even though HuBERT is trained primarily on speech, its learned representations can be used as general audio embeddings or adapted via fine-tuning.
+
+4.3 BEATs
+BEATs focuses on general audio pretraining and argues that discrete label prediction, which has been effective in other modalities, can encourage representations that capture high-level audio semantics rather than reconstructing low-level details. BEATs introduces an iterative procedure that jointly improves an acoustic tokenizer and an audio SSL model. The method reports strong performance on diverse audio classification benchmarks.
+
+In the ASD context, BEATs is attractive because it is trained to capture general audio semantics and may produce embeddings that are more robust to nuisance variations, potentially benefiting domain-shifted industrial audio.
+
+5. Embedding-space anomaly detection: k-NN, memory banks, and distance-to-normality
+Once embeddings are available, a natural approach is to define “normality” as proximity to a set of normal embeddings. This leads to a family of distance-based or neighbor-based anomaly detection methods.
+
+5.1 k-NN anomaly scoring
+The k-nearest neighbors (k-NN) approach stores embeddings from normal training data in a memory bank and computes anomaly scores for a test example based on its distance to the closest normal embeddings. Intuitively, normal samples should lie near other normal samples, while anomalies should fall farther away.
+
+Common choices include Euclidean distance (often on normalized embeddings) and cosine distance (1 minus cosine similarity). Cosine distance is particularly convenient for embeddings where direction carries semantic information and magnitude is less meaningful, or when embeddings are explicitly L2-normalized.
+
+k-NN scoring can be summarized as:
+- Build memory bank M = {m_i} from normal embeddings.
+- For a test embedding q, find the k closest neighbors in M.
+- Return the mean (or another aggregate) of distances to those neighbors as the anomaly score.
+
+This style of method has several advantages for first-shot settings: it has few hyperparameters (primarily k and the distance metric), can work well with strong pretrained embeddings, and avoids training a large task-specific network that might overfit to the development machine types.
+
+5.2 Alternatives: Mahalanobis distance and density modeling
+A related baseline is the Mahalanobis distance, which estimates the mean and covariance of normal embeddings and scores anomalies by their distance under that covariance. This assumes embeddings for normal data are approximately Gaussian or at least well-characterized by second-order statistics. Other approaches include one-class SVMs, Gaussian mixture models, and normalizing flows.
+
+Compared to these, k-NN is non-parametric and can model multi-modal normal distributions without explicitly choosing the number of modes, at the cost of memory and compute that scale with the number of stored examples.
+
+6. Domain shift and adaptation strategies for ASD
+6.1 Domain generalization and noise shift
+Domain shift in DCASE Task 2 includes changes in machine state and environmental noise. A representation that entangles these factors may incorrectly treat domain differences as anomalies. Therefore, domain generalization methods aim to learn invariances that preserve anomaly-relevant structure while suppressing domain-specific nuisance variation.
+
+Common robustness strategies include:
+- Data augmentation that simulates noise and operating condition changes.
+- Feature normalization and calibration.
+- Training objectives that reduce domain dependence.
+- Using pretrained embeddings that already exhibit some invariances.
+
+6.2 Fine-tuning under first-shot constraints
+Fine-tuning can adapt representations to the target domain, but it risks overfitting when only a small number of target-domain examples are available. In first-shot settings, a lightweight adaptation method that avoids extensive hyperparameter tuning is preferred.
+
+One pragmatic approach is self-distillation or feature distillation: a teacher model (frozen) produces target features, and a student model is trained to match them under the target domain’s audio distribution. This can function as a regularized adaptation mechanism that nudges features toward a stable target distribution without requiring labels.
+
+7. How this repository fits into the literature
+This repository implements a simple, literature-aligned baseline: SSL transformer embeddings + k-NN anomaly scoring. The implementation emphasizes minimal training complexity and leverages pretrained representations.
+
+7.1 Backbone embedding extraction
+The backbone wrapper in this repository supports multiple torchaudio pipelines, including HuBERT, wav2vec2/XLSR, and BEATs-family models. For waveform-based backbones (e.g., HuBERT), the model extracts frame-level features from raw waveform inputs and then aggregates them into a clip-level embedding using mean pooling over time.
+
+A key design choice is mean pooling of frame-level representations to obtain a fixed-dimensional embedding per clip. This aligns with the task requirement to produce one anomaly score per clip, while remaining computationally simple.
+
+7.2 Memory bank construction (normal embeddings)
+The training step builds a memory bank of normal embeddings by running the backbone over training clips, optionally applying L2 normalization to embeddings. The resulting list of embeddings is stored for use during inference.
+
+7.3 k-NN anomaly scoring with cosine distance
+At inference time, the system computes embeddings for test clips, then scores each clip by the mean distance to its k nearest neighbors in the memory bank, using cosine distance. Higher distance indicates greater deviation from the normal embedding manifold.
+
+7.4 Thresholding and decisions
+While AUC/pAUC do not require a decision threshold, the task also requests binary decisions. This repository computes a threshold from normal training data by estimating the distribution of neighbor distances within the memory bank and selecting a percentile-based threshold (commonly 90th percentile). This is conceptually related to baseline practices that set thresholds based on normal-score distributions and avoids using evaluation data for tuning.
+
+7.5 Fine-tuning via feature distillation
+The repository includes a fine-tuning script that performs self-supervised feature distillation: a teacher and student (initialized from the same pretrained pipeline) process audio, and the student is optimized to match the teacher’s pooled features via mean squared error. The resulting weights can be loaded by the backbone wrapper.
+
+This adaptation strategy is simple and does not require labeled anomalies, which matches the unsupervised nature of Task 2. However, its benefit depends on how much target-domain data is available and how well the distillation objective aligns with the goal of improving anomaly separability under domain shift.
+
+7.6 Reported development performance
+The meta information file associated with this system reports development AUC and pAUC values per machine type. These results illustrate that performance is uneven across machine types and domains, which is typical in ASD under domain shifts and highlights the importance of robust representations and calibration.
+
+8. Discussion: strengths, limitations, and opportunities
+Strengths:
+- Conceptual simplicity: a strong pretrained backbone plus a non-parametric k-NN detector reduces the need for extensive training and per-machine tuning.
+- Alignment with first-shot constraints: few tunable hyperparameters and reliance on pretrained representations make the approach plausible for unseen machine types.
+- Robustness potential: cosine distance on normalized embeddings can reduce sensitivity to amplitude and scaling differences.
+
+Limitations:
+- Scalability: k-NN inference cost grows with the size of the memory bank; GPU acceleration mitigates but does not eliminate this.
+- Pooling choice: mean pooling may smooth out transient anomalies; some anomalies may be brief and not dominate the average embedding.
+- Threshold calibration: a fixed percentile threshold may not be optimal across machine types and may produce inconsistent precision/recall.
+- Fine-tuning ambiguity: self-distillation can preserve teacher features rather than explicitly improving anomaly discrimination; benefits may be modest without a carefully designed objective.
+
+Opportunities for future work (within typical challenge constraints):
+- Improved temporal aggregation: attention pooling, statistics pooling, or max/quantile pooling to better capture transient events.
+- Better use of supplementary clean/noise-only data: explicit noise modeling or noise-invariant embedding learning.
+- Approximate nearest neighbor search: improve k-NN scalability with indexing methods.
+- Hybrid scoring: combine k-NN with parametric density estimation (e.g., Mahalanobis on a whitened space) to stabilize thresholds.
+
+9. Conclusion
+The DCASE 2025 Task 2 first-shot setting emphasizes robustness under domain and noise shifts without per-machine hyperparameter tuning. In this context, embedding-based anomaly detection provides an attractive design pattern: a large pretrained SSL transformer generates representations, and a lightweight detector such as k-NN estimates deviation from normality.
+
+This repository implements that pattern using torchaudio-provided SSL backbones and a cosine k-NN memory bank, optionally augmented with a simple self-distillation fine-tuning step. The approach reflects current trends in ASD research, where strong pretrained representations can enable simple detectors to achieve competitive performance, especially under data efficiency and domain shift constraints.
+
+REFERENCES (suggested; no strict style)
+1) DCASE 2025 Task 2 official description page: “First-Shot Unsupervised Anomalous Sound Detection for Machine Condition Monitoring” (DCASE community website).
+2) Nishida, Harada, Niizumi, et al. “Description and discussion on DCASE 2025 challenge task 2: first-shot unsupervised anomalous sound detection for machine condition monitoring.” arXiv:2506.10097 (linked from the DCASE task page).
+3) Harada, Niizumi, Takeuchi, Ohishi, Yasuda. “First-shot anomaly detection for machine condition monitoring: a domain generalization baseline.” EUSIPCO 2023 (linked from the DCASE task page).
+4) Hsu, Bolte, Tsai, Lakhotia, Salakhutdinov, Mohamed. “HuBERT: Self-Supervised Speech Representation Learning by Masked Prediction of Hidden Units.” arXiv:2106.07447.
+5) Baevski, Zhou, Mohamed, Auli. “wav2vec 2.0: A Framework for Self-Supervised Learning of Speech Representations.” (canonical wav2vec 2.0 paper).
+6) Chen, Wu, Wang, Liu, Tompkins, Chen, Wei. “BEATs: Audio Pre-Training with Acoustic Tokenizers.” arXiv:2212.09058.
+
+(If you attach your DCASE technical report PDF text, I will add a final reference entry for it and align the “this repository” description to the exact claims and experiments described there.)
