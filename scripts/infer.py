@@ -17,17 +17,53 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import numpy as np
-import torch, torchaudio
+import torch
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from src.utils.file_utils      import load_config
 from src.models.beats_backbone import BEATsBackbone
+from src.utils.audio_utils import load_audio_mono
+
+
+def compute_threshold(mem_bank: torch.Tensor, k: int, distance: str, pct: float, chunk: int = 1024) -> float:
+    """Compute kNN mean-distance threshold from within-bank distances."""
+    N = mem_bank.size(0)
+    mem_dists = []
+
+    for i in tqdm(
+        range(0, N, chunk),
+        desc="  threshold chunks",
+        unit="chunk",
+        file=sys.stdout,
+        dynamic_ncols=True,
+    ):
+        sub = mem_bank[i : i + chunk]
+        if distance == "cosine":
+            d = 1.0 - (sub @ mem_bank.T)
+        else:
+            d = torch.cdist(sub, mem_bank)
+
+        for j in range(d.size(0)):
+            global_idx = i + j
+            if global_idx < N:
+                d[j, global_idx] = float("inf")
+
+        topk = torch.topk(d, k=k, dim=1, largest=False).values
+        mem_dists.append(topk.mean(dim=1).cpu().numpy())
+
+    mem_dists = np.concatenate(mem_dists, axis=0)
+    return float(np.percentile(mem_dists, pct))
 
 def main():
     # 1) Argparse & config
     p = argparse.ArgumentParser()
     p.add_argument("--config", default="configs/default.yaml")
+    p.add_argument(
+        "--machine",
+        default=None,
+        help="If set, run inference only for this machine under eval_data/raw/<machine>/test.",
+    )
     args   = p.parse_args()
     cfg    = load_config(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -37,52 +73,48 @@ def main():
     csv_dir  = Path(cfg["logging"]["csv_out_dir"])
     csv_dir.mkdir(parents=True, exist_ok=True)
 
-    # 3) Load backbone & raw memory-bank (CPU)
+    # 3) Load backbone
     backbone = BEATsBackbone(cfg["model"]["embedding"]).to(device).eval()
-    ckpt     = torch.load(bank_dir/"memory_bank.pt", map_location="cpu")
-    raw_mem  = ckpt["memory"]  # list of [1×D] tensors
 
-    # 4) Build GPU mem_bank of shape (N_train, D)
-    mem_bank = torch.stack([x.squeeze(0) for x in raw_mem], dim=0).to(device)
-    N, D = mem_bank.shape
+    # 4) Detector settings
     K = cfg.get("detector", {}).get("k", cfg.get("model", {}).get("k", 3))
     distance = str(cfg.get("detector", {}).get("distance", "cosine")).lower()
     normalize = bool(cfg.get("model", {}).get("normalize", False))
-    if normalize:
-        mem_bank = F.normalize(mem_bank, dim=-1)
+    pct = cfg.get("threshold", {}).get("percentile", 90)
+    chunk = 1024  # adjust to fit your GPU
 
-    # 5) Compute decision threshold on GPU in chunks
-    print("▶ Computing threshold distances on GPU…")
-    mem_dists = []
-    chunk     = 1024  # adjust to fit your GPU
-    for i in tqdm(range(0, N, chunk),
-                  desc="  threshold chunks",
-                  unit="chunk",
-                  file=sys.stdout,
-                  dynamic_ncols=True):
-        sub = mem_bank[i : i+chunk]           # (chunk, D)
-        # full pairwise distances (chunk, N)
-        if distance == "cosine":
-            d = 1.0 - (sub @ mem_bank.T)
-        else:
-            d = torch.cdist(sub, mem_bank)        # GPU
-        # ignore self-dist: set diagonal in each row-block to large value
-        for j in range(d.size(0)):
-            global_idx = i + j
-            if global_idx < N:
-                d[j, global_idx] = float("inf")
-        # take k smallest per row
-        topk = torch.topk(d, k=K, dim=1, largest=False).values  # (chunk, K)
-        mem_dists.append(topk.mean(dim=1).cpu().numpy())
+    # 5) Per-machine cache: {machine: {mem_bank, threshold}}
+    cache = {}
 
-    mem_dists = np.concatenate(mem_dists, axis=0)  # (N,)
-    pct       = cfg.get("threshold", {}).get("percentile", 90)
-    threshold = float(np.percentile(mem_dists, pct))
-    print(f"▶ Decision threshold @ {pct}th percentile = {threshold:.6f}")
+    def prepare_machine(machine: str):
+        specific = bank_dir / f"memory_bank_{machine}.pt"
+        default = bank_dir / "memory_bank.pt"
+        use_specific = specific.exists()
+        bank_path = specific if use_specific else default
+
+        cache_key = machine if use_specific else "__default__"
+        if cache_key in cache:
+            return cache[cache_key]["mem_bank"], cache[cache_key]["threshold"]
+
+        ckpt = torch.load(bank_path, map_location="cpu")
+        raw_mem = ckpt["memory"]
+        mem_bank = torch.stack([x.squeeze(0) for x in raw_mem], dim=0).to(device)
+        if normalize:
+            mem_bank = F.normalize(mem_bank, dim=-1)
+
+        print(f"▶ Computing threshold for {machine} using {bank_path.name} …")
+        threshold = compute_threshold(mem_bank=mem_bank, k=K, distance=distance, pct=pct, chunk=chunk)
+        print(f"▶ {machine}: threshold @ {pct}th percentile = {threshold:.6f}")
+
+        cache[cache_key] = {"mem_bank": mem_bank, "threshold": threshold, "bank_path": str(bank_path)}
+        return mem_bank, threshold
 
     # 6) Gather eval_data test WAVs
     root    = cfg["data"]["root"]
-    pattern = f"{root}/eval_data/raw/*/test/**/*.wav"
+    if args.machine:
+        pattern = f"{root}/eval_data/raw/{args.machine}/test/**/*.wav"
+    else:
+        pattern = f"{root}/eval_data/raw/*/test/**/*.wav"
     wavs    = sorted(glob.glob(pattern, recursive=True))
     print(f"▶ Found {len(wavs)} eval clips under: {pattern}")
     if not wavs:
@@ -97,10 +129,12 @@ def main():
                      file=sys.stdout,
                      leave=True,
                      dynamic_ncols=True):
-        wav, sr = torchaudio.load(path)
-        if wav.size(0) > 1:
-            wav = wav.mean(dim=0, keepdim=True)
+        wav, sr = load_audio_mono(path)
         wav = wav.to(device); sr = int(sr)
+
+        p       = Path(path)
+        machine = p.parent.parent.name      # e.g. CoffeeGrinder
+        mem_bank, threshold = prepare_machine(machine)
 
         # backbone→embedding (1, D)
         feat = backbone(wav, sr)
@@ -116,8 +150,6 @@ def main():
         score = float(topk.mean().item())
         decision = 1 if score > threshold else 0
 
-        p       = Path(path)
-        machine = p.parent.parent.name      # e.g. CoffeeGrinder
         section = p.stem.split("_")[1]         # take "section_XX_####" → ["section","XX","####"]
         tag     = f"{machine}_section_{section}"
 
