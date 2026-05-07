@@ -7,14 +7,13 @@ import torch, torchaudio
 
 
 class BEATsBackbone(torch.nn.Module):
-    def __init__(self, checkpoint="HUBERT_BASE", use_layer_stack: bool = False, pooling: str = "mean"):
+    def __init__(self, checkpoint="HUBERT_BASE", use_layer_stack=False):
         super().__init__()
 
         self.bundle = getattr(torchaudio.pipelines, checkpoint)
         self.model = self.bundle.get_model().eval()
         self.sample_rate = self.bundle.sample_rate
         self.use_layer_stack = use_layer_stack
-        self.pooling = str(pooling).lower()
 
         # waveform vs. spectrogram input
         self.expect_waveform = checkpoint.startswith(
@@ -38,7 +37,7 @@ class BEATsBackbone(torch.nn.Module):
 
     # -------------------------------------------------------- #
     @torch.no_grad()
-    def forward(self, wav: torch.Tensor, sr: int | torch.Tensor, return_frames: bool = False):
+    def forward(self, wav: torch.Tensor, sr: int | torch.Tensor):
         sr = int(sr) if torch.is_tensor(sr) else sr
         if sr != self.sample_rate:
             wav = torchaudio.functional.resample(wav, sr, self.sample_rate)
@@ -57,9 +56,4 @@ class BEATsBackbone(torch.nn.Module):
         else:
             feats = x[-1] if isinstance(x, list) else x
 
-        # feats: (B, T, D)
-        if return_frames or self.pooling in {"none", "frames", "frame"}:
-            return feats
-
-        # default: time-average to (B, D)
-        return feats.mean(dim=1)
+        return feats.mean(dim=1)                   # (B, D)

@@ -86,13 +86,3 @@ Key options:
 * `torchaudio`, `scikit‑learn`, `librosa`
 
 This repo is released under the **MIT License** — see `LICENSE` for details.
-
----
-
-## improvments
-
-1) per‑machine (AutoTrash) memory bank + per‑machine threshold
-2) Keep distance=cosine and enable L2 normalization
-
-
-
