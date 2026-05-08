@@ -29,6 +29,15 @@ model:
 detector:
   k: 3                            # k-nearest neighbours
   distance: cosine
+  temporal:
+    enabled: false                 # true = frame-level kNN + temporal aggregation
+    aggregation: p95               # max | p95 | mean
+    percentile: 95                 # used when aggregation=p95
+    frame_stride: 1                # >1 subsamples frames to speed up
+
+threshold:
+  percentile: 90                   # decision threshold percentile
+  train_samples: 200               # used only when detector.temporal.enabled=true
 
 # ------------------------------------------------------------------
 # Training / inference misc
