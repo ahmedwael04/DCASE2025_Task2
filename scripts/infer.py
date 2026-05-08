@@ -80,6 +80,9 @@ def main():
     K = cfg.get("detector", {}).get("k", cfg.get("model", {}).get("k", 3))
     distance = str(cfg.get("detector", {}).get("distance", "cosine")).lower()
     normalize = bool(cfg.get("model", {}).get("normalize", False))
+    if distance == "cosine" and not normalize:
+        print("⚠️  distance=cosine but model.normalize=false; forcing L2 normalization.")
+        normalize = True
     pct = cfg.get("threshold", {}).get("percentile", 90)
     chunk = 1024  # adjust to fit your GPU
 

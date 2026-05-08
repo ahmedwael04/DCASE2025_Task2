@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import torch, torchaudio
+import torch
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
 
@@ -22,6 +22,7 @@ if str(REPO_ROOT) not in sys.path:
 from src.utils.file_utils     import load_config
 from src.models.beats_backbone import BEATsBackbone
 from src.models.detector      import KNNDetector
+from src.utils.audio_utils    import load_audio_mono
 
 
 def compute_metrics(cfg_path: str):
@@ -36,8 +37,12 @@ def compute_metrics(cfg_path: str):
         map_location=device
     )
     k = cfg.get("detector", {}).get("k", cfg.get("model", {}).get("k", 3))
-    detector = KNNDetector(k=k)
+    distance = str(cfg.get("detector", {}).get("distance", "cosine")).lower()
     normalize = bool(cfg.get("model", {}).get("normalize", False))
+    if distance == "cosine" and not normalize:
+        print("⚠️  distance=cosine but model.normalize=false; forcing L2 normalization.")
+        normalize = True
+    detector = KNNDetector(k=k, normalize=normalize)
     bank_mem = bank_ckpt["memory"]
     if normalize:
         bank_mem = [F.normalize(x, dim=-1) for x in bank_mem]
@@ -62,9 +67,7 @@ def compute_metrics(cfg_path: str):
             label = 1 if "anomaly" in os.path.basename(f) else 0
 
             # run inference
-            wav, sr = torchaudio.load(f)
-            if wav.shape[0] > 1:
-                wav = wav.mean(dim=0, keepdim=True)
+            wav, sr = load_audio_mono(f)
             feat  = backbone(wav.to(device), sr)
             if normalize:
                 feat = F.normalize(feat, dim=-1)

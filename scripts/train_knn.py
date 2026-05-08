@@ -92,8 +92,13 @@ def main():
     ).to(device).eval()
 
     k = cfg.get("detector", {}).get("k", cfg.get("model", {}).get("k", 3))
-    detector = KNNDetector(k=k)
+    distance = str(cfg.get("detector", {}).get("distance", "cosine")).lower()
     normalize = bool(cfg.get("model", {}).get("normalize", False))
+    if distance == "cosine" and not normalize:
+        print("⚠️  distance=cosine but model.normalize=false; forcing L2 normalization.")
+        normalize = True
+
+    detector = KNNDetector(k=k, normalize=normalize)
 
     feats, paths = [], []
     for batch in tqdm(loader, desc="Extracting embeddings"):

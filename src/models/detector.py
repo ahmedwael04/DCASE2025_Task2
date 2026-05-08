@@ -11,14 +11,32 @@ import numpy as np
 
 
 class KNNDetector:
-    def __init__(self, k: int = 3):
+    def __init__(self, k: int = 3, normalize: bool = False):
         self.k = k
         self.nn = NearestNeighbors(n_neighbors=k, metric="cosine")
+        self.normalize = bool(normalize)
         self.memory: np.ndarray | None = None
+        
+    @staticmethod
+    def _l2_normalize_np(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+        norm = np.linalg.norm(x, axis=-1, keepdims=True)
+        return x / np.maximum(norm, eps)
 
     def fit(self, features: List[torch.Tensor]):
-        # concat variable‑length sequences by mean‑pooling over time
-        pooled = [f.mean(dim=0).cpu().numpy() for f in features]
+        def pool_to_vec(x: torch.Tensor) -> torch.Tensor:
+            # Accept shapes: (D,), (1,D), (T,D), (B,T,D)
+            if x.ndim == 1:
+                return x
+            if x.ndim == 2:
+                return x.squeeze(0) if x.size(0) == 1 else x.mean(dim=0)
+            if x.ndim == 3:
+                x = x.mean(dim=1)  # (B,T,D) -> (B,D)
+                return x.squeeze(0) if x.size(0) == 1 else x.mean(dim=0)
+            raise ValueError(f"Unsupported feature shape: {tuple(x.shape)}")
+
+        pooled = [pool_to_vec(f).cpu().numpy() for f in features]
+        if self.normalize:
+            pooled = [self._l2_normalize_np(p) for p in pooled]
         self.memory = np.stack(pooled, axis=0)
         self.nn.fit(self.memory)
 
@@ -27,7 +45,19 @@ class KNNDetector:
         if self.memory is None:
             raise RuntimeError("Detector has not been fitted!")
 
-        pooled = features.mean(dim=0, keepdim=True).cpu().numpy()
+        if features.ndim == 1:
+            pooled = features.unsqueeze(0)
+        elif features.ndim == 2:
+            pooled = features if features.size(0) == 1 else features.mean(dim=0, keepdim=True)
+        elif features.ndim == 3:
+            pooled = features.mean(dim=1)
+            pooled = pooled if pooled.size(0) == 1 else pooled.mean(dim=0, keepdim=True)
+        else:
+            raise ValueError(f"Unsupported feature shape: {tuple(features.shape)}")
+
+        pooled = pooled.cpu().numpy()
+        if self.normalize:
+            pooled = self._l2_normalize_np(pooled)
         dists, _ = self.nn.kneighbors(pooled)
         return float(dists.mean())
         
