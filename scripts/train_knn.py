@@ -20,7 +20,6 @@ if str(REPO_ROOT) not in sys.path:
 from src.utils.file_utils import load_config
 from src.data.dcase_dataset import DCASETask2Dataset
 from src.models.beats_backbone import BEATsBackbone
-from src.models.detector import KNNDetector
 
 
 def collate(batch):
@@ -51,6 +50,49 @@ def collect_wavs(root: str, split: str, stage: str = "both", machine: str | None
     return wavs
 
 
+def make_window_embeddings(
+    temporal_feats: torch.Tensor,
+    win_frames: int,
+    hop_frames: int,
+) -> torch.Tensor:
+    """Convert temporal features to window embeddings.
+
+    Args:
+        temporal_feats: (B,T,D) or (T,D). Assumes B==1 if 3D.
+        win_frames: window size in frames.
+        hop_frames: hop size in frames.
+
+    Returns:
+        (W,D) window embeddings (mean over frames per window).
+    """
+    if temporal_feats.ndim == 3:
+        if temporal_feats.size(0) != 1:
+            raise ValueError(f"Expected B==1 temporal feats, got {tuple(temporal_feats.shape)}")
+        x = temporal_feats[0]
+    elif temporal_feats.ndim == 2:
+        x = temporal_feats
+    else:
+        raise ValueError(f"Unsupported temporal feats shape: {tuple(temporal_feats.shape)}")
+
+    T, D = x.shape
+    if T == 0:
+        raise ValueError("Empty temporal features")
+
+    win_frames = int(win_frames)
+    hop_frames = int(hop_frames)
+    if win_frames <= 0 or hop_frames <= 0:
+        raise ValueError("win_frames and hop_frames must be > 0")
+
+    if T < win_frames:
+        return x.mean(dim=0, keepdim=True)
+
+    windows = []
+    for start in range(0, T - win_frames + 1, hop_frames):
+        seg = x[start : start + win_frames]
+        windows.append(seg.mean(dim=0))
+    return torch.stack(windows, dim=0)  # (W,D)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/default.yaml")
@@ -58,6 +100,24 @@ def main():
         "--machine",
         default=None,
         help="If set, build a memory bank only for this machine (e.g., AutoTrash).",
+    )
+    ap.add_argument(
+        "--bank-level",
+        default="clip",
+        choices=["clip", "window"],
+        help="Store clip-level embeddings or window-level embeddings in the memory bank.",
+    )
+    ap.add_argument(
+        "--win-frames",
+        type=int,
+        default=50,
+        help="Window size in frames when --bank-level=window.",
+    )
+    ap.add_argument(
+        "--hop-frames",
+        type=int,
+        default=50,
+        help="Hop size in frames when --bank-level=window (default: non-overlapping).",
     )
     ap.add_argument(
         "--stage",
@@ -98,28 +158,47 @@ def main():
         print("⚠️  distance=cosine but model.normalize=false; forcing L2 normalization.")
         normalize = True
 
-    detector = KNNDetector(k=k, normalize=normalize)
-
     feats, paths = [], []
     for batch in tqdm(loader, desc="Extracting embeddings"):
         wav, sr, path = batch[0]
-        feat = backbone(wav.to(device), sr)
-        if normalize:
-            feat = F.normalize(feat, dim=-1)
-        feats.append(feat.cpu())
-        paths.append(path)
 
-    detector.fit(feats)
+        if args.bank_level == "clip":
+            feat = backbone(wav.to(device), sr)
+            if normalize:
+                feat = F.normalize(feat, dim=-1)
+            feats.append(feat.cpu())
+            paths.append(path)
+        else:
+            temporal = backbone(wav.to(device), sr, return_temporal=True)  # (1,T,D)
+            win_emb = make_window_embeddings(temporal, args.win_frames, args.hop_frames)  # (W,D)
+            if normalize:
+                win_emb = F.normalize(win_emb, dim=-1)
+
+            # store each window as its own bank entry
+            for w_i in range(win_emb.size(0)):
+                feats.append(win_emb[w_i].detach().cpu())
+                paths.append(f"{path}#win={w_i}")
 
     out_dir = Path(cfg["logging"]["bank_out"])
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_name = "memory_bank.pt" if args.machine is None else f"memory_bank_{args.machine}.pt"
+    if args.machine is None:
+        out_name = "memory_bank.pt"
+    else:
+        suffix = "" if args.bank_level == "clip" else "_window"
+        out_name = f"memory_bank_{args.machine}{suffix}.pt"
     out_path = out_dir / out_name
     torch.save(
         {
             "memory": feats,
             "paths": paths,
-            "meta": {"machine": args.machine, "stage": args.stage, "split": "train"},
+            "meta": {
+                "machine": args.machine,
+                "stage": args.stage,
+                "split": "train",
+                "bank_level": args.bank_level,
+                "win_frames": args.win_frames if args.bank_level == "window" else None,
+                "hop_frames": args.hop_frames if args.bank_level == "window" else None,
+            },
         },
         out_path,
     )

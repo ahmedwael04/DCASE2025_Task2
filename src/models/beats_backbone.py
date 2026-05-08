@@ -37,7 +37,7 @@ class BEATsBackbone(torch.nn.Module):
 
     # -------------------------------------------------------- #
     @torch.no_grad()
-    def forward(self, wav: torch.Tensor, sr: int | torch.Tensor):
+    def forward(self, wav: torch.Tensor, sr: int | torch.Tensor, return_temporal: bool = False):
         sr = int(sr) if torch.is_tensor(sr) else sr
         if sr != self.sample_rate:
             wav = torchaudio.functional.resample(wav, sr, self.sample_rate)
@@ -55,5 +55,8 @@ class BEATsBackbone(torch.nn.Module):
             feats = torch.cat(x[::3], dim=-1)      # concat layers 0,3,6,9
         else:
             feats = x[-1] if isinstance(x, list) else x
+
+        if return_temporal:
+            return feats  # (B, T, D)
 
         return feats.mean(dim=1)                   # (B, D)

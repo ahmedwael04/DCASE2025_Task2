@@ -94,3 +94,12 @@ This repo is released under the **MIT License** — see `LICENSE` for details.
 2) Keep distance=cosine and enable L2 normalization
 
 
+pipeline till now 8/5/2026
+
+per-machine memory bank
++ separate source/target banks
++ cosine distance
++ L2 normalization
++ temporal/window scoring
++ top-5 mean aggregation
++ K = 3
