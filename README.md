@@ -92,3 +92,5 @@ This repo is released under the **MIT License** — see `LICENSE` for details.
 
 1) per‑machine (AutoTrash) memory bank + per‑machine threshold
 2) Keep distance=cosine and enable L2 normalization
+
+
