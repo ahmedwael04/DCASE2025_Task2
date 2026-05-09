@@ -128,7 +128,7 @@ def main():
         "--stage",
         default="eval_data",
         choices=["dev_data", "eval_data"],
-        help="Which dataset stage to score (eval_data is unlabeled; dev_data is labeled via filenames).",
+        help="Which dataset stage to score.",
     )
     p.add_argument(
         "--machine",
@@ -158,12 +158,6 @@ def main():
         type=int,
         default=5,
         help="Aggregate by mean of top-N window scores when --score-level=window.",
-    )
-    p.add_argument(
-        "--default-domain",
-        default="target",
-        choices=["source", "target"],
-        help="Domain to assume when filenames don't encode it (eval_data typically doesn't).",
     )
     args   = p.parse_args()
     cfg    = load_config(args.config)
@@ -214,7 +208,7 @@ def main():
         except Exception:
             ckpt = None
 
-        # We need non-tensor metadata (`paths`) for per-domain normalization; reload if missing.
+        # We need non-tensor metadata (`paths`) to split the bank into source/target for bookkeeping.
         if not (isinstance(ckpt, dict) and "memory" in ckpt and "paths" in ckpt):
             ckpt = torch.load(bank_path, map_location="cpu")
         raw_mem = ckpt["memory"]
@@ -260,26 +254,24 @@ def main():
             f"source={mem_banks['counts']['source']}, target={mem_banks['counts']['target']}, all={mem_banks['counts']['__all__']}"
         )
 
+        # Unified threshold/stats: score uses both domains jointly.
         thresholds: dict[str, float] = {}
         dom_stats: dict[str, tuple[float, float]] = {}
 
-        for dom_key in ("source", "target", "__all__"):
-            bank = mem_banks[dom_key]
-            # Threshold/stats computed within-domain bank only
-            print(f"▶ Computing threshold for {machine} ({dom_key}) …")
-            thr, mem_dists = compute_threshold_and_mem_dists(
-                mem_bank=bank,
-                k=K,
-                distance=distance,
-                pct=pct,
-                chunk=chunk,
-            )
-            thresholds[dom_key] = float(thr)
-            mu = float(np.mean(mem_dists))
-            sig = float(np.std(mem_dists))
-            if not np.isfinite(sig) or sig < 1e-12:
-                sig = 1.0
-            dom_stats[dom_key] = (mu, sig)
+        print(f"▶ Computing unified threshold for {machine} (__all__) …")
+        thr, mem_dists = compute_threshold_and_mem_dists(
+            mem_bank=mem_banks["__all__"],
+            k=K,
+            distance=distance,
+            pct=pct,
+            chunk=chunk,
+        )
+        thresholds["__all__"] = float(thr)
+        mu = float(np.mean(mem_dists))
+        sig = float(np.std(mem_dists))
+        if not np.isfinite(sig) or sig < 1e-12:
+            sig = 1.0
+        dom_stats["__all__"] = (mu, sig)
 
         # If a domain split is missing, fallback will point to __all__ at use time.
         cache[cache_key] = {
@@ -321,10 +313,10 @@ def main():
             machine = p.parent.parent.name  # e.g. CoffeeGrinder
             pack = prepare_machine(machine)
 
-            dom = infer_domain_from_name(p.name) or args.default_domain
-            mem_bank = pack["mem_banks"][dom] if dom in pack["mem_banks"] else pack["mem_banks"]["__all__"]
-            threshold = pack["thresholds"][dom] if dom in pack["thresholds"] else pack["thresholds"]["__all__"]
-            mu, sig = pack["dom_stats"][dom] if dom in pack["dom_stats"] else pack["dom_stats"]["__all__"]
+            # Unified scoring: always use the combined bank and single calibration.
+            mem_bank = pack["mem_banks"]["__all__"]
+            threshold = pack["thresholds"]["__all__"]
+            mu, sig = pack["dom_stats"]["__all__"]
 
             if args.score_level == "clip":
                 # backbone→embedding (1, D)
@@ -359,10 +351,8 @@ def main():
                 top_vals = torch.topk(win_scores, k=n_top, largest=True).values
                 score = float(top_vals.mean().item())
 
-            # Per-domain score normalization (calibration)
+            # Score normalization (calibration)
             score_n = (float(score) - float(mu)) / float(sig)
-            if dom == "source":
-                score_n = -score_n
             thr_n = (float(threshold) - float(mu)) / float(sig)
             decision = 1 if score_n > thr_n else 0
 
