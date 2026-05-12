@@ -37,7 +37,13 @@ class BEATsBackbone(torch.nn.Module):
 
     # -------------------------------------------------------- #
     @torch.no_grad()
-    def forward(self, wav: torch.Tensor, sr: int | torch.Tensor, return_temporal: bool = False):
+    def forward(
+        self,
+        wav: torch.Tensor,
+        sr: int | torch.Tensor,
+        return_temporal: bool = False,
+        spec_augment=None,
+    ):
         sr = int(sr) if torch.is_tensor(sr) else sr
         if sr != self.sample_rate:
             wav = torchaudio.functional.resample(wav, sr, self.sample_rate)
@@ -47,6 +53,8 @@ class BEATsBackbone(torch.nn.Module):
             out = self.model.extract_features(wav)
         else:
             mel = self.mel(wav)
+            if spec_augment is not None:
+                mel = spec_augment(mel)
             out = self.model.extract_features(mel)
 
         # normalise return types

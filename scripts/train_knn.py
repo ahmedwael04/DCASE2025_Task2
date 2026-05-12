@@ -20,6 +20,13 @@ if str(REPO_ROOT) not in sys.path:
 from src.utils.file_utils import load_config
 from src.data.dcase_dataset import DCASETask2Dataset
 from src.models.beats_backbone import BEATsBackbone
+from src.utils.augmentation import (
+    SpecAugment,
+    WaveformAugmentor,
+    describe_augmentation,
+    discover_noise_files,
+    set_random_seed,
+)
 
 
 def collate(batch):
@@ -128,6 +135,15 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    aug_cfg = cfg.get("augmentation", {})
+    seed = aug_cfg.get("seed", None)
+    set_random_seed(seed)
+    aug_rng = torch.Generator()
+    if seed is not None:
+        aug_rng.manual_seed(int(seed))
+    else:
+        aug_rng.seed()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     root = cfg["data"]["root"]
@@ -151,6 +167,25 @@ def main():
         use_layer_stack=cfg["model"].get("use_layer_stack", False),
     ).to(device).eval()
 
+    augmentation_enabled = bool(aug_cfg.get("enabled", False))
+    augmentation_copies = int(aug_cfg.get("copies_per_sample", 0)) if augmentation_enabled else 0
+    noise_files = discover_noise_files(root, aug_cfg.get("noise_dirs"))
+    waveform_augmentor = WaveformAugmentor(
+        aug_cfg.get("waveform", {}),
+        noise_files=noise_files,
+        generator=aug_rng,
+    )
+    spec_augment = SpecAugment(aug_cfg.get("spectrogram", {}), generator=aug_rng)
+    spec_augment_active = (
+        augmentation_enabled
+        and augmentation_copies > 0
+        and bool(aug_cfg.get("spectrogram", {}).get("enabled", True))
+        and float(aug_cfg.get("spectrogram", {}).get("probability", 0.0)) > 0.0
+        and not backbone.expect_waveform
+    )
+    for line in describe_augmentation(aug_cfg, len(noise_files), spec_augment_active):
+        print(line)
+
     k = cfg.get("detector", {}).get("k", cfg.get("model", {}).get("k", 3))
     distance = str(cfg.get("detector", {}).get("distance", "cosine")).lower()
     normalize = bool(cfg.get("model", {}).get("normalize", False))
@@ -161,23 +196,34 @@ def main():
     feats, paths = [], []
     for batch in tqdm(loader, desc="Extracting embeddings"):
         wav, sr, path = batch[0]
+        variants = [(wav, path, False)]
+        for copy_idx in range(augmentation_copies):
+            aug_wav = waveform_augmentor(wav, int(sr))
+            variants.append((aug_wav, f"{path}#aug={copy_idx}", True))
 
-        if args.bank_level == "clip":
-            feat = backbone(wav.to(device), sr)
-            if normalize:
-                feat = F.normalize(feat, dim=-1)
-            feats.append(feat.cpu())
-            paths.append(path)
-        else:
-            temporal = backbone(wav.to(device), sr, return_temporal=True)  # (1,T,D)
-            win_emb = make_window_embeddings(temporal, args.win_frames, args.hop_frames)  # (W,D)
-            if normalize:
-                win_emb = F.normalize(win_emb, dim=-1)
+        for wav_i, path_i, is_augmented in variants:
+            mel_aug = spec_augment if (is_augmented and spec_augment_active) else None
+            if args.bank_level == "clip":
+                feat = backbone(wav_i.to(device), sr, spec_augment=mel_aug)
+                if normalize:
+                    feat = F.normalize(feat, dim=-1)
+                feats.append(feat.cpu())
+                paths.append(path_i)
+            else:
+                temporal = backbone(
+                    wav_i.to(device),
+                    sr,
+                    return_temporal=True,
+                    spec_augment=mel_aug,
+                )  # (1,T,D)
+                win_emb = make_window_embeddings(temporal, args.win_frames, args.hop_frames)  # (W,D)
+                if normalize:
+                    win_emb = F.normalize(win_emb, dim=-1)
 
-            # store each window as its own bank entry
-            for w_i in range(win_emb.size(0)):
-                feats.append(win_emb[w_i].detach().cpu())
-                paths.append(f"{path}#win={w_i}")
+                # store each window as its own bank entry
+                for w_i in range(win_emb.size(0)):
+                    feats.append(win_emb[w_i].detach().cpu())
+                    paths.append(f"{path_i}#win={w_i}")
 
     out_dir = Path(cfg["logging"]["bank_out"])
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -198,6 +244,13 @@ def main():
                 "bank_level": args.bank_level,
                 "win_frames": args.win_frames if args.bank_level == "window" else None,
                 "hop_frames": args.hop_frames if args.bank_level == "window" else None,
+                "augmentation": {
+                    "enabled": augmentation_enabled,
+                    "copies_per_sample": augmentation_copies,
+                    "seed": seed,
+                    "noise_files": len(noise_files),
+                    "spec_augment_active": spec_augment_active,
+                },
             },
         },
         out_path,
