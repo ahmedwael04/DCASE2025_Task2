@@ -96,7 +96,10 @@ detector:
     frame_stride: 1                # >1 subsamples frames to speed up
 
 threshold:
+  method: percentile
   percentile: 90                   # decision threshold percentile
+  sweep_enabled: false
+  sweep_values: [80, 85, 90, 92.5, 95]
   train_samples: 200               # used only when detector.temporal.enabled=true
 
 # ------------------------------------------------------------------
