@@ -8,7 +8,7 @@ Produces:
 under your csv_out_dir (configs/default.yaml).
 """
 
-import argparse, sys, glob
+import argparse, sys, glob, subprocess
 from pathlib import Path
 
 # Allow running as: python scripts/infer.py
@@ -24,6 +24,26 @@ from tqdm.auto import tqdm
 from src.utils.file_utils      import load_config
 from src.models.beats_backbone import BEATsBackbone
 from src.utils.audio_utils import load_audio_mono
+from src.augmentations import (
+    AugmentationConfig,
+    DomainGeneralizationAugmentor,
+    aggregate_augmented_scores,
+    describe_augmentation,
+    set_augmentation_seed,
+)
+from src.pipeline import (
+    bank_matches_memory_config,
+    bank_matches_pipeline,
+    describe_pipeline,
+    get_bank_path,
+    get_legacy_bank_paths,
+    get_memory_bank_config,
+    get_pipeline_mode,
+    get_stale_bank_paths,
+    get_top_windows,
+    get_window_params,
+    validate_pipeline_memory_compatibility,
+)
 
 
 def infer_domain_from_name(name: str) -> str | None:
@@ -120,6 +140,95 @@ def compute_threshold_and_mem_dists(
     threshold = float(np.percentile(mem_dists, pct))
     return threshold, mem_dists
 
+
+def score_clustered_knn(
+    query: torch.Tensor,
+    mem_bank: torch.Tensor,
+    cluster_labels: torch.Tensor,
+    centroids: torch.Tensor,
+    k: int,
+    distance: str,
+    min_cluster_size: int,
+    exclude_index: int | None = None,
+) -> tuple[float, dict]:
+    """Score one clip embedding by nearest centroid, then kNN inside that cluster."""
+    if query.ndim == 1:
+        query = query.unsqueeze(0)
+    if query.ndim != 2 or query.size(0) != 1:
+        raise ValueError(f"Expected one query embedding with shape (1,D), got {tuple(query.shape)}")
+
+    q_norm = F.normalize(query, dim=-1)
+    c_norm = F.normalize(centroids, dim=-1)
+    centroid_dists = 1.0 - (q_norm @ c_norm.T)
+    cluster_id = int(torch.argmin(centroid_dists, dim=1).item())
+    centroid_distance = float(centroid_dists[0, cluster_id].item())
+
+    selected = torch.nonzero(cluster_labels == cluster_id, as_tuple=False).flatten()
+    cluster_size = int(selected.numel())
+    fallback = cluster_size < max(1, int(min_cluster_size)) or cluster_size < int(k)
+
+    if not fallback and exclude_index is not None:
+        selected = selected[selected != int(exclude_index)]
+        fallback = int(selected.numel()) < int(k)
+
+    if fallback:
+        selected = torch.arange(mem_bank.size(0), device=mem_bank.device)
+        if exclude_index is not None and selected.numel() > 1:
+            selected = selected[selected != int(exclude_index)]
+
+    bank = mem_bank[selected]
+    if distance == "cosine":
+        d = 1.0 - (query @ bank.T)
+    else:
+        d = torch.cdist(query, bank)
+
+    k_eff = min(int(k), int(d.size(1)))
+    topk = torch.topk(d, k=k_eff, dim=1, largest=False).values
+    score = float(topk.mean().item())
+    debug = {
+        "cluster_id": cluster_id,
+        "cluster_size": cluster_size,
+        "centroid_distance": centroid_distance,
+        "fallback_global": fallback,
+        "k_used": k_eff,
+        "score": score,
+    }
+    return score, debug
+
+
+def compute_clustered_threshold_and_mem_dists(
+    mem_bank: torch.Tensor,
+    cluster_labels: torch.Tensor,
+    centroids: torch.Tensor,
+    k: int,
+    distance: str,
+    pct: float,
+    min_cluster_size: int,
+) -> tuple[float, np.ndarray]:
+    mem_dists = []
+    for i in tqdm(
+        range(mem_bank.size(0)),
+        desc="  clustered threshold",
+        unit="entry",
+        file=sys.stdout,
+        dynamic_ncols=True,
+    ):
+        score, _ = score_clustered_knn(
+            query=mem_bank[i : i + 1],
+            mem_bank=mem_bank,
+            cluster_labels=cluster_labels,
+            centroids=centroids,
+            k=k,
+            distance=distance,
+            min_cluster_size=min_cluster_size,
+            exclude_index=i,
+        )
+        mem_dists.append(score)
+
+    mem_dists_np = np.asarray(mem_dists, dtype=np.float32)
+    threshold = float(np.percentile(mem_dists_np, pct))
+    return threshold, mem_dists_np
+
 def main():
     # 1) Argparse & config
     p = argparse.ArgumentParser()
@@ -137,30 +246,50 @@ def main():
     )
     p.add_argument(
         "--score-level",
-        default="clip",
+        default=None,
         choices=["clip", "window"],
-        help="Score clips directly, or score windows and aggregate to clip score.",
+        help="Deprecated alias for --pipeline-mode.",
+    )
+    p.add_argument(
+        "--pipeline-mode",
+        default=None,
+        choices=["clip", "window"],
+        help="Override pipeline.mode from config.",
     )
     p.add_argument(
         "--win-frames",
         type=int,
-        default=50,
-        help="Window size in frames when --score-level=window.",
+        default=None,
+        help="Window size in frames when pipeline mode is window.",
     )
     p.add_argument(
         "--hop-frames",
         type=int,
-        default=50,
-        help="Hop size in frames when --score-level=window (default: non-overlapping).",
+        default=None,
+        help="Hop size in frames when pipeline mode is window.",
     )
     p.add_argument(
         "--top-windows",
         type=int,
-        default=5,
-        help="Aggregate by mean of top-N window scores when --score-level=window.",
+        default=None,
+        help="Aggregate by mean of top-N window scores when pipeline mode is window.",
     )
     args   = p.parse_args()
     cfg    = load_config(args.config)
+    pipeline_override = args.pipeline_mode or args.score_level
+    pipeline_mode = get_pipeline_mode(cfg, pipeline_override)
+    win_frames, hop_frames = get_window_params(cfg, args.win_frames, args.hop_frames)
+    top_windows = get_top_windows(cfg, args.top_windows)
+    memory_cfg = get_memory_bank_config(cfg)
+    memory_mode = memory_cfg["mode"]
+    validate_pipeline_memory_compatibility(pipeline_mode, memory_mode)
+    aug_config = AugmentationConfig.from_config(cfg)
+    set_augmentation_seed(aug_config.seed)
+    aug_rng = torch.Generator()
+    if aug_config.seed is not None:
+        aug_rng.manual_seed(int(aug_config.seed))
+    else:
+        aug_rng.seed()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # 2) Paths
@@ -170,6 +299,20 @@ def main():
 
     # 3) Load backbone
     backbone = BEATsBackbone(cfg["model"]["embedding"]).to(device).eval()
+    augmentor = DomainGeneralizationAugmentor(aug_config, generator=aug_rng)
+    test_aug_views = aug_config.num_views_test if aug_config.enabled else 0
+    spec_augment_active = (
+        aug_config.enabled
+        and test_aug_views > 0
+        and (aug_config.freq_mask_max > 0 or aug_config.time_mask_max > 0)
+        and not backbone.expect_waveform
+    )
+    for line in describe_augmentation(aug_config, phase="test-scoring"):
+        print(line)
+    if aug_config.enabled and test_aug_views > 0 and spec_augment_active:
+        print("  log-mel masking: active for augmented spectrogram views")
+    elif aug_config.enabled and test_aug_views > 0:
+        print("  log-mel masking: inactive for waveform-input backbone")
 
     # 4) Detector settings
     K = cfg.get("detector", {}).get("k", cfg.get("model", {}).get("k", 3))
@@ -178,28 +321,29 @@ def main():
     if distance == "cosine" and not normalize:
         print("⚠️  distance=cosine but model.normalize=false; forcing L2 normalization.")
         normalize = True
+    print(f"Detector: k={K}, distance={distance}, normalize={normalize}")
+    print(f"Test-time augmentation views: {test_aug_views}, aggregation={aug_config.test_score_agg}")
+    for line in describe_pipeline(pipeline_mode, win_frames, hop_frames, top_windows):
+        print(line)
+    print(f"Memory bank mode: {memory_mode}")
+    if memory_mode == "clustered":
+        print(f"  scoring method: {memory_cfg['cluster_score_mode']}")
+        print(f"  requested clusters: {memory_cfg['num_clusters']}")
+        print(f"  min_cluster_size: {memory_cfg['min_cluster_size']}")
+    else:
+        print("  scoring method: global kNN")
     pct = cfg.get("threshold", {}).get("percentile", 90)
     chunk = 1024  # adjust to fit your GPU
+    verbose_debug = str(cfg.get("logging", {}).get("level", "info")).lower() == "debug"
 
     # 5) Per-machine cache: {machine: {mem_banks, thresholds, dom_stats}}
     cache = {}
+    auto_rebuild_bank = bool(cfg.get("pipeline", {}).get("auto_rebuild_bank", True))
+    cleanup_stale_banks = bool(cfg.get("pipeline", {}).get("cleanup_stale_banks", True)) or bool(
+        memory_cfg["cleanup_stale_banks"]
+    )
 
-    def prepare_machine(machine: str):
-        # Prefer window-level bank if user requested window scoring.
-        specific_window = bank_dir / f"memory_bank_{machine}_window.pt"
-        specific_clip = bank_dir / f"memory_bank_{machine}.pt"
-        default = bank_dir / "memory_bank.pt"
-
-        if args.score_level == "window" and specific_window.exists():
-            bank_path = specific_window
-            cache_key = f"{machine}__window"
-        else:
-            use_specific = specific_clip.exists()
-            bank_path = specific_clip if use_specific else default
-            cache_key = machine if use_specific else "__default__"
-        if cache_key in cache:
-            return cache[cache_key]
-
+    def load_bank_checkpoint(bank_path: Path) -> dict:
         ckpt = None
         try:
             ckpt = torch.load(bank_path, map_location="cpu", weights_only=True)
@@ -208,11 +352,104 @@ def main():
         except Exception:
             ckpt = None
 
-        # We need non-tensor metadata (`paths`) to split the bank into source/target for bookkeeping.
         if not (isinstance(ckpt, dict) and "memory" in ckpt and "paths" in ckpt):
             ckpt = torch.load(bank_path, map_location="cpu")
+        return ckpt
+
+    def rebuild_bank(machine: str, reason: str) -> None:
+        if not auto_rebuild_bank:
+            raise RuntimeError(
+                f"{reason}\n"
+                "Set pipeline.auto_rebuild_bank=true or rebuild explicitly with:\n"
+                f"  python scripts/train_knn.py --config {args.config} --machine {machine} --pipeline-mode {pipeline_mode}"
+            )
+
+        print(f"WARNING: {reason}")
+        print(f"Rebuilding {pipeline_mode} memory bank for {machine} before scoring.")
+        cmd = [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "train_knn.py"),
+            "--config",
+            args.config,
+            "--machine",
+            machine,
+            "--stage",
+            "both",
+            "--pipeline-mode",
+            pipeline_mode,
+            "--win-frames",
+            str(win_frames),
+            "--hop-frames",
+            str(hop_frames),
+        ]
+        subprocess.run(cmd, check=True)
+
+    def ensure_bank(machine: str) -> Path:
+        bank_path = get_bank_path(
+            bank_dir,
+            machine,
+            pipeline_mode,
+            memory_mode,
+            memory_cfg["num_clusters"],
+        )
+        legacy_paths = [p for p in get_legacy_bank_paths(bank_dir, machine, pipeline_mode) if p != bank_path]
+
+        stale_existing = get_stale_bank_paths(
+            bank_dir,
+            machine,
+            pipeline_mode,
+            memory_mode,
+            memory_cfg["num_clusters"],
+        )
+        stale_existing.extend([p for p in legacy_paths if p.exists()])
+        stale_existing = sorted(set(stale_existing))
+        for stale_path in stale_existing:
+            print(
+                f"WARNING: Active pipeline is {pipeline_mode}/{memory_mode}, ignoring mismatched/stale bank: "
+                f"{stale_path.name}"
+            )
+            if cleanup_stale_banks:
+                print(f"Removing stale/mismatched memory bank: {stale_path}")
+                stale_path.unlink()
+
+        if not bank_path.exists():
+            hints = []
+            for stale_path in stale_existing:
+                hints.append(f"found stale bank: {stale_path.name}")
+            hint_text = f" ({'; '.join(hints)})" if hints else ""
+            rebuild_bank(
+                machine,
+                f"Required {pipeline_mode} bank is missing: {bank_path.name}{hint_text}",
+            )
+
+        ckpt = load_bank_checkpoint(bank_path)
+        meta = ckpt.get("meta", {}) if isinstance(ckpt, dict) else {}
+        matches, reason = bank_matches_pipeline(meta, pipeline_mode, win_frames, hop_frames)
+        if not matches:
+            rebuild_bank(machine, f"Memory bank {bank_path.name} is stale/mismatched: {reason}")
+        matches, reason = bank_matches_memory_config(
+            meta,
+            memory_mode,
+            memory_cfg["num_clusters"],
+        )
+        if not matches:
+            rebuild_bank(machine, f"Memory bank {bank_path.name} is stale/mismatched: {reason}")
+
+        if not bank_path.exists():
+            raise RuntimeError(f"Expected rebuilt bank was not created: {bank_path}")
+        return bank_path
+
+    def prepare_machine(machine: str):
+        bank_path = ensure_bank(machine)
+        cache_key = f"{machine}__{pipeline_mode}__{memory_mode}__k{memory_cfg['num_clusters']}"
+        if cache_key in cache:
+            return cache[cache_key]
+
+        ckpt = load_bank_checkpoint(bank_path)
         raw_mem = ckpt["memory"]
         raw_paths = ckpt.get("paths", [""] * len(raw_mem))
+        bank_aug_meta = ckpt.get("meta", {}).get("augmentation", {}) if isinstance(ckpt, dict) else {}
+        meta = ckpt.get("meta", {}) if isinstance(ckpt, dict) else {}
 
         # Allow entries as (D,), (1,D), etc.
         def to_vec(x: torch.Tensor) -> torch.Tensor:
@@ -249,23 +486,72 @@ def main():
             },
         }
 
+        feature_dim = int(mem_banks["__all__"].size(1))
+        matches, reason = bank_matches_memory_config(
+            meta,
+            memory_mode,
+            memory_cfg["num_clusters"],
+            feature_dim,
+        )
+        if not matches:
+            rebuild_bank(machine, f"Memory bank {bank_path.name} is stale/mismatched: {reason}")
+            return prepare_machine(machine)
+
+        cluster_labels = None
+        centroids = None
+        if memory_mode == "clustered":
+            if "cluster_labels" not in ckpt or "centroids" not in ckpt:
+                rebuild_bank(machine, f"Clustered bank {bank_path.name} is missing cluster_labels/centroids")
+                return prepare_machine(machine)
+            cluster_labels = ckpt["cluster_labels"].to(device=device, dtype=torch.long)
+            centroids = ckpt["centroids"].to(device=device, dtype=mem_banks["__all__"].dtype)
+            if normalize:
+                centroids = F.normalize(centroids, dim=-1)
+
         print(
             f"▶ Preparing {machine} bank ({bank_path.name}): "
             f"source={mem_banks['counts']['source']}, target={mem_banks['counts']['target']}, all={mem_banks['counts']['__all__']}"
         )
+
+        if bank_aug_meta:
+            print(
+                "  bank augmentation: "
+                f"enabled={bank_aug_meta.get('enabled')}, "
+                f"views={bank_aug_meta.get('num_views_train', bank_aug_meta.get('copies_per_sample', 0))}, "
+                f"mode={bank_aug_meta.get('memory_mode', 'expand')}, "
+                f"before={bank_aug_meta.get('clean_entries', 'unknown')}, "
+                f"after={bank_aug_meta.get('total_entries', len(raw_mem))}"
+            )
+        print(f"  loaded bank path: {bank_path}")
+        if memory_mode == "clustered":
+            print(
+                f"  clustered bank: clusters={centroids.size(0)}, "
+                f"score_mode={memory_cfg['cluster_score_mode']}, min_cluster_size={memory_cfg['min_cluster_size']}"
+            )
 
         # Unified threshold/stats: score uses both domains jointly.
         thresholds: dict[str, float] = {}
         dom_stats: dict[str, tuple[float, float]] = {}
 
         print(f"▶ Computing unified threshold for {machine} (__all__) …")
-        thr, mem_dists = compute_threshold_and_mem_dists(
-            mem_bank=mem_banks["__all__"],
-            k=K,
-            distance=distance,
-            pct=pct,
-            chunk=chunk,
-        )
+        if memory_mode == "clustered":
+            thr, mem_dists = compute_clustered_threshold_and_mem_dists(
+                mem_bank=mem_banks["__all__"],
+                cluster_labels=cluster_labels,
+                centroids=centroids,
+                k=K,
+                distance=distance,
+                pct=pct,
+                min_cluster_size=memory_cfg["min_cluster_size"],
+            )
+        else:
+            thr, mem_dists = compute_threshold_and_mem_dists(
+                mem_bank=mem_banks["__all__"],
+                k=K,
+                distance=distance,
+                pct=pct,
+                chunk=chunk,
+            )
         thresholds["__all__"] = float(thr)
         mu = float(np.mean(mem_dists))
         sig = float(np.std(mem_dists))
@@ -279,6 +565,8 @@ def main():
             "thresholds": thresholds,
             "dom_stats": dom_stats,
             "bank_path": str(bank_path),
+            "cluster_labels": cluster_labels,
+            "centroids": centroids,
         }
         return cache[cache_key]
 
@@ -294,8 +582,21 @@ def main():
         print("⚠️  No test files found for this stage/machine.")
         sys.exit(1)
 
+    def machine_from_path(path: Path) -> str:
+        parts = path.parts
+        if "raw" in parts:
+            raw_idx = parts.index("raw")
+            if raw_idx + 1 < len(parts):
+                return parts[raw_idx + 1]
+        if "test" in parts:
+            test_idx = parts.index("test")
+            if test_idx > 0:
+                return parts[test_idx - 1]
+        return path.parent.parent.name
+
     # 7) Inference loop with live GPU-knn scoring
     writers = {}
+    clustered_fallback_warned = set()
     try:
         for path in tqdm(
             wavs,
@@ -310,31 +611,56 @@ def main():
             sr = int(sr)
 
             p = Path(path)
-            machine = p.parent.parent.name  # e.g. CoffeeGrinder
+            machine = machine_from_path(p)
             pack = prepare_machine(machine)
 
             # Unified scoring: always use the combined bank and single calibration.
             mem_bank = pack["mem_banks"]["__all__"]
             threshold = pack["thresholds"]["__all__"]
             mu, sig = pack["dom_stats"]["__all__"]
+            cluster_labels = pack.get("cluster_labels")
+            centroids = pack.get("centroids")
 
-            if args.score_level == "clip":
+            if pipeline_mode == "clip":
                 # backbone→embedding (1, D)
                 feat = backbone(wav, sr)
                 if normalize:
                     feat = F.normalize(feat, dim=-1)
 
                 # GPU k‐NN scoring
-                if distance == "cosine":
-                    d = 1.0 - (feat @ mem_bank.T)
+                if memory_mode == "clustered":
+                    score, debug = score_clustered_knn(
+                        query=feat,
+                        mem_bank=mem_bank,
+                        cluster_labels=cluster_labels,
+                        centroids=centroids,
+                        k=K,
+                        distance=distance,
+                        min_cluster_size=memory_cfg["min_cluster_size"],
+                    )
+                    if verbose_debug:
+                        print(
+                            f"DEBUG {p.name}: cluster={debug['cluster_id']} size={debug['cluster_size']} "
+                            f"centroid_dist={debug['centroid_distance']:.6f} fallback={debug['fallback_global']} "
+                            f"score={debug['score']:.6f}"
+                        )
+                    elif debug["fallback_global"] and machine not in clustered_fallback_warned:
+                        print(
+                            f"Clustered kNN fallback to global bank for {machine}: "
+                            f"selected cluster {debug['cluster_id']} size={debug['cluster_size']}."
+                        )
+                        clustered_fallback_warned.add(machine)
                 else:
-                    d = torch.cdist(feat, mem_bank)  # (1, N)
-                topk = torch.topk(d, k=K, dim=1, largest=False).values  # (1, K)
-                score = float(topk.mean().item())
+                    if distance == "cosine":
+                        d = 1.0 - (feat @ mem_bank.T)
+                    else:
+                        d = torch.cdist(feat, mem_bank)  # (1, N)
+                    topk = torch.topk(d, k=K, dim=1, largest=False).values  # (1, K)
+                    score = float(topk.mean().item())
             else:
                 # window-level scoring + top-N aggregation
                 temporal = backbone(wav, sr, return_temporal=True)  # (1,T,D)
-                win_emb = make_window_embeddings(temporal, args.win_frames, args.hop_frames)  # (W,D)
+                win_emb = make_window_embeddings(temporal, win_frames, hop_frames)  # (W,D)
                 if normalize:
                     win_emb = F.normalize(win_emb, dim=-1)
 
@@ -346,10 +672,78 @@ def main():
                 topk = torch.topk(d, k=K, dim=1, largest=False).values  # (W,K)
                 win_scores = topk.mean(dim=1)  # (W,)
 
-                n_top = max(1, int(args.top_windows))
+                n_top = top_windows
                 n_top = min(n_top, win_scores.numel())
                 top_vals = torch.topk(win_scores, k=n_top, largest=True).values
                 score = float(top_vals.mean().item())
+
+            if aug_config.enabled and test_aug_views > 0:
+                view_scores = [float(score)]
+                for wav_i, _, is_augmented in augmentor.waveform_views(wav, sr, test_aug_views):
+                    if not is_augmented:
+                        continue
+                    wav_i = wav_i.to(device)
+                    mel_aug = augmentor.augment_spectrogram if spec_augment_active else None
+
+                    if pipeline_mode == "clip":
+                        feat = backbone(wav_i, sr, spec_augment=mel_aug)
+                        if normalize:
+                            feat = F.normalize(feat, dim=-1)
+
+                        if memory_mode == "clustered":
+                            view_score, debug = score_clustered_knn(
+                                query=feat,
+                                mem_bank=mem_bank,
+                                cluster_labels=cluster_labels,
+                                centroids=centroids,
+                                k=K,
+                                distance=distance,
+                                min_cluster_size=memory_cfg["min_cluster_size"],
+                            )
+                            if verbose_debug:
+                                print(
+                                    f"DEBUG {p.name}: cluster={debug['cluster_id']} size={debug['cluster_size']} "
+                                    f"centroid_dist={debug['centroid_distance']:.6f} fallback={debug['fallback_global']} "
+                                    f"score={debug['score']:.6f}"
+                                )
+                            elif debug["fallback_global"] and machine not in clustered_fallback_warned:
+                                print(
+                                    f"Clustered kNN fallback to global bank for {machine}: "
+                                    f"selected cluster {debug['cluster_id']} size={debug['cluster_size']}."
+                                )
+                                clustered_fallback_warned.add(machine)
+                            view_scores.append(float(view_score))
+                        else:
+                            if distance == "cosine":
+                                d = 1.0 - (feat @ mem_bank.T)
+                            else:
+                                d = torch.cdist(feat, mem_bank)
+                            topk = torch.topk(d, k=K, dim=1, largest=False).values
+                            view_scores.append(float(topk.mean().item()))
+                    else:
+                        temporal = backbone(
+                            wav_i,
+                            sr,
+                            return_temporal=True,
+                            spec_augment=mel_aug,
+                        )
+                        win_emb = make_window_embeddings(temporal, win_frames, hop_frames)
+                        if normalize:
+                            win_emb = F.normalize(win_emb, dim=-1)
+
+                        if distance == "cosine":
+                            d = 1.0 - (win_emb @ mem_bank.T)
+                        else:
+                            d = torch.cdist(win_emb, mem_bank)
+
+                        topk = torch.topk(d, k=K, dim=1, largest=False).values
+                        win_scores = topk.mean(dim=1)
+                        n_top = top_windows
+                        n_top = min(n_top, win_scores.numel())
+                        top_vals = torch.topk(win_scores, k=n_top, largest=True).values
+                        view_scores.append(float(top_vals.mean().item()))
+
+                score = aggregate_augmented_scores(view_scores, aug_config.test_score_agg)
 
             # Score normalization (calibration)
             score_n = (float(score) - float(mu)) / float(sig)

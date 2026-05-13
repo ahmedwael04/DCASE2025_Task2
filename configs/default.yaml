@@ -19,48 +19,64 @@ train:
   num_workers: 2       # same as dataloader.num_workers
 
 # ------------------------------------------------------------------
-# Data augmentation
+# Pipeline mode
+# ------------------------------------------------------------------
+pipeline:
+  # clip: one embedding per clip, clip bank, clip scoring.
+  # window: window embeddings in the bank, window scoring with top-N aggregation.
+  mode: clip
+  win_frames: 50
+  hop_frames: 50
+  top_windows: 5
+
+  # During inference, rebuild a missing/stale bank for the requested mode.
+  auto_rebuild_bank: true
+
+  # During training, remove stale banks for the same machine/mode family.
+  cleanup_stale_banks: true
+
+# ------------------------------------------------------------------
+# Memory bank scoring
+# ------------------------------------------------------------------
+memory_bank:
+  # plain: current global kNN memory bank.
+  # clustered: clip-only KMeans bank with nearest-cluster kNN scoring.
+  mode: clustered
+  num_clusters: 6
+  cluster_method: kmeans
+  cluster_score_mode: nearest_cluster_knn
+  min_cluster_size: 3
+  cleanup_stale_banks: true
+
+# ------------------------------------------------------------------
+# Domain-generalization augmentation
 # ------------------------------------------------------------------
 augmentation:
-  enabled: true
+  # Code also accepts equivalent top-level AUG_* keys, e.g. AUG_ENABLE.
+  # Set false for the exact clean baseline path.
+  enabled: false
   seed: 42
 
-  # Each normal training clip is kept clean and also gets this many
-  # stochastic augmented copies in the memory bank.
-  copies_per_sample: 1
+  # Number of stochastic views in addition to the clean original.
+  num_views_train: 4
+  num_views_test: 0
 
-  # Optional folders, relative to data.root unless absolute. If omitted or
-  # missing, the trainer searches common noise folder names and skips safely.
-  noise_dirs:
-    - noise
-    - noises
-    - background_noise
+  # "expand" stores clean + augmented embeddings in the memory bank.
+  # "average" stores one averaged embedding per clip.
+  memory_mode: average
 
-  waveform:
-    gain:
-      enabled: true
-      probability: 0.4
-      min: 0.7
-      max: 1.3
+  # Test score aggregation over clean + augmented views: median or mean.
+  test_score_agg: median
 
-    noise:
-      enabled: true
-      probability: 0.3
-      snr_min_db: 10
-      snr_max_db: 25
-
-    eq:
-      enabled: true
-      probability: 0.2
-
-  spectrogram:
-    enabled: true
-    probability: 0.3
-    freq_mask_param: 8
-    time_mask_param: 24
-    max_freq_masks: 1
-    max_time_masks: 1
-    max_time_fraction: 0.05
+  # Mild perturbations for microphone/domain shift robustness.
+  gain_db: [-6, 6]
+  noise_snr_db: [15, 35]
+  time_shift_max: 0.05
+  freq_mask_max: 8
+  time_mask_max: 20
+  colored_noise: true
+  eq: true
+  reverb: true
 
 # ------------------------------------------------------------------
 # Model
