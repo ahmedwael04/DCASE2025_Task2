@@ -8,6 +8,7 @@ from typing import Any
 
 VALID_PIPELINE_MODES = {"clip", "window"}
 VALID_MEMORY_BANK_MODES = {"plain", "clustered"}
+VALID_CLUSTER_SCORE_NORMALIZATION = {"none", "mean_ratio", "zscore", "robust_zscore"}
 
 
 def get_pipeline_mode(cfg: dict[str, Any], override: str | None = None) -> str:
@@ -57,13 +58,38 @@ def get_memory_bank_config(cfg: dict[str, Any]) -> dict[str, Any]:
     if score_mode != "nearest_cluster_knn":
         raise ValueError("Only memory_bank.cluster_score_mode='nearest_cluster_knn' is currently supported")
 
+    score_norm = str(bank_cfg.get("cluster_score_normalization", "none")).lower()
+    if score_norm not in VALID_CLUSTER_SCORE_NORMALIZATION:
+        valid = ", ".join(sorted(VALID_CLUSTER_SCORE_NORMALIZATION))
+        raise ValueError(f"memory_bank.cluster_score_normalization must be one of: {valid}")
+
     return {
         "mode": mode,
         "num_clusters": max(1, int(bank_cfg.get("num_clusters", 6))),
         "cluster_method": method,
         "cluster_score_mode": score_mode,
+        "cluster_score_normalization": score_norm,
+        "cluster_score_eps": float(bank_cfg.get("cluster_score_eps", 1e-6)),
         "min_cluster_size": max(1, int(bank_cfg.get("min_cluster_size", 3))),
         "cleanup_stale_banks": bool(bank_cfg.get("cleanup_stale_banks", True)),
+    }
+
+
+def get_embedding_postprocess_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    post_cfg = cfg.get("embedding_postprocess", {})
+    if not isinstance(post_cfg, dict):
+        post_cfg = {}
+    pca_cfg = post_cfg.get("pca_whitening", {})
+    if not isinstance(pca_cfg, dict):
+        pca_cfg = {}
+
+    return {
+        "pca_whitening": {
+            "enabled": bool(pca_cfg.get("enabled", False)),
+            "n_components": max(1, int(pca_cfg.get("n_components", 128))),
+            "whiten": bool(pca_cfg.get("whiten", True)),
+            "l2_after": bool(pca_cfg.get("l2_after", True)),
+        }
     }
 
 
@@ -80,6 +106,8 @@ def get_bank_path(
     mode: str,
     memory_mode: str = "plain",
     num_clusters: int | None = None,
+    cluster_score_normalization: str = "none",
+    pca_n_components: int | None = None,
 ) -> Path:
     """Return the canonical bank path for a machine/mode pair."""
     mode = get_pipeline_mode({}, mode)
@@ -91,7 +119,16 @@ def get_bank_path(
     stem = "memory_bank" if machine is None else f"memory_bank_{machine}"
     if memory_mode == "clustered":
         k = max(1, int(num_clusters or 1))
-        return Path(bank_dir) / f"{stem}_{mode}_clustered_k{k}.pt"
+        score_norm = str(cluster_score_normalization or "none").lower()
+        if score_norm not in VALID_CLUSTER_SCORE_NORMALIZATION:
+            valid = ", ".join(sorted(VALID_CLUSTER_SCORE_NORMALIZATION))
+            raise ValueError(f"cluster_score_normalization must be one of: {valid}")
+        name = f"{stem}_{mode}_clustered_k{k}"
+        if score_norm != "none":
+            name += f"_norm_{score_norm}"
+        if pca_n_components is not None:
+            name += f"_pca{max(1, int(pca_n_components))}"
+        return Path(bank_dir) / f"{name}.pt"
     return Path(bank_dir) / f"{stem}_{mode}.pt"
 
 
@@ -137,6 +174,9 @@ def bank_matches_memory_config(
     memory_mode: str,
     num_clusters: int | None = None,
     feature_dim: int | None = None,
+    cluster_score_normalization: str | None = None,
+    pca_enabled: bool | None = None,
+    pca_n_components: int | None = None,
 ) -> tuple[bool, str]:
     saved_mode = str(meta.get("memory_bank_mode", "plain")).lower()
     if saved_mode != memory_mode:
@@ -147,9 +187,29 @@ def bank_matches_memory_config(
         if saved_clusters is not None and num_clusters is not None and int(saved_clusters) != int(num_clusters):
             return False, f"bank num_clusters={saved_clusters}, requested num_clusters={num_clusters}"
 
+        if cluster_score_normalization is not None:
+            saved_norm = str(meta.get("cluster_score_normalization", "none")).lower()
+            requested_norm = str(cluster_score_normalization).lower()
+            if saved_norm != requested_norm:
+                return False, (
+                    f"bank cluster_score_normalization={saved_norm!r}, "
+                    f"requested cluster_score_normalization={requested_norm!r}"
+                )
+
     saved_dim = meta.get("feature_dim")
     if saved_dim is not None and feature_dim is not None and int(saved_dim) != int(feature_dim):
         return False, f"bank feature_dim={saved_dim}, embedding feature_dim={feature_dim}"
+
+    if pca_enabled is not None:
+        saved_post = meta.get("embedding_postprocess", {})
+        saved_pca = saved_post.get("pca_whitening", {}) if isinstance(saved_post, dict) else {}
+        saved_enabled = bool(saved_pca.get("enabled", False))
+        if saved_enabled != bool(pca_enabled):
+            return False, f"bank PCA enabled={saved_enabled}, requested PCA enabled={bool(pca_enabled)}"
+        if saved_enabled and pca_n_components is not None:
+            saved_components = saved_pca.get("requested_n_components", saved_pca.get("n_components"))
+            if saved_components is not None and int(saved_components) != int(pca_n_components):
+                return False, f"bank PCA components={saved_components}, requested PCA components={pca_n_components}"
 
     return True, "ok"
 
@@ -160,11 +220,21 @@ def get_stale_bank_paths(
     pipeline_mode: str,
     memory_mode: str,
     num_clusters: int | None = None,
+    cluster_score_normalization: str = "none",
+    pca_n_components: int | None = None,
 ) -> list[Path]:
     """Return same-machine bank files that can conflict with the active bank."""
     root = Path(bank_dir)
     stem = "memory_bank" if machine is None else f"memory_bank_{machine}"
-    active = get_bank_path(root, machine, pipeline_mode, memory_mode, num_clusters)
+    active = get_bank_path(
+        root,
+        machine,
+        pipeline_mode,
+        memory_mode,
+        num_clusters,
+        cluster_score_normalization,
+        pca_n_components,
+    )
 
     candidates = [
         root / f"{stem}_clip.pt",
@@ -178,6 +248,14 @@ def get_stale_bank_paths(
     stale: list[Path] = []
     for candidate in candidates:
         if candidate.exists() and candidate.resolve() != active.resolve():
+            # Preserve final AutoTrash k=6 ablation variants so sequential runs do not
+            # delete the baseline or sibling normalization/PCA banks.
+            if (
+                machine is not None
+                and str(machine).lower() == "autotrash"
+                and candidate.name.startswith(f"{stem}_clip_clustered_k6")
+            ):
+                continue
             stale.append(candidate)
     return sorted(set(stale))
 

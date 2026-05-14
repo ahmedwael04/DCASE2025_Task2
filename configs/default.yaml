@@ -60,8 +60,65 @@ memory_bank:
   num_clusters: 6
   cluster_method: kmeans
   cluster_score_mode: nearest_cluster_knn
+  # none | mean_ratio | zscore | robust_zscore
+  cluster_score_normalization: none
+  cluster_score_eps: 1e-6
   min_cluster_size: 3
   cleanup_stale_banks: true
+
+# ------------------------------------------------------------------
+# Embedding post-processing
+# ------------------------------------------------------------------
+embedding_postprocess:
+  pca_whitening:
+    enabled: false
+    n_components: 128
+    whiten: true
+    l2_after: true
+
+# ------------------------------------------------------------------
+# Final AutoTrash ablation examples
+# ------------------------------------------------------------------
+# A) Current best baseline:
+# pipeline:
+#   mode: clip
+# memory_bank:
+#   mode: clustered
+#   num_clusters: 6
+#   cluster_score_normalization: none
+# embedding_postprocess:
+#   pca_whitening:
+#     enabled: false
+#
+# B) Mean-ratio normalization:
+# memory_bank:
+#   mode: clustered
+#   num_clusters: 6
+#   cluster_score_normalization: mean_ratio
+#
+# C) Z-score normalization:
+# memory_bank:
+#   mode: clustered
+#   num_clusters: 6
+#   cluster_score_normalization: zscore
+#
+# D) Robust z-score:
+# memory_bank:
+#   mode: clustered
+#   num_clusters: 6
+#   cluster_score_normalization: robust_zscore
+#
+# E) Z-score + PCA whitening:
+# memory_bank:
+#   mode: clustered
+#   num_clusters: 6
+#   cluster_score_normalization: zscore
+# embedding_postprocess:
+#   pca_whitening:
+#     enabled: true
+#     n_components: 128
+#     whiten: true
+#     l2_after: true
 
 # ------------------------------------------------------------------
 # Domain-generalization augmentation

@@ -36,6 +36,7 @@ from src.pipeline import (
     bank_matches_pipeline,
     describe_pipeline,
     get_bank_path,
+    get_embedding_postprocess_config,
     get_legacy_bank_paths,
     get_memory_bank_config,
     get_pipeline_mode,
@@ -44,6 +45,8 @@ from src.pipeline import (
     get_window_params,
     validate_pipeline_memory_compatibility,
 )
+from src.cluster_scoring import score_clustered_knn as score_clustered_knn_impl
+from src.embedding_postprocess import apply_pca_whitening_tensor
 
 
 def infer_domain_from_name(name: str) -> str | None:
@@ -149,51 +152,25 @@ def score_clustered_knn(
     k: int,
     distance: str,
     min_cluster_size: int,
+    score_normalization: str = "none",
+    cluster_stats: dict | None = None,
+    eps: float = 1e-6,
     exclude_index: int | None = None,
 ) -> tuple[float, dict]:
     """Score one clip embedding by nearest centroid, then kNN inside that cluster."""
-    if query.ndim == 1:
-        query = query.unsqueeze(0)
-    if query.ndim != 2 or query.size(0) != 1:
-        raise ValueError(f"Expected one query embedding with shape (1,D), got {tuple(query.shape)}")
-
-    q_norm = F.normalize(query, dim=-1)
-    c_norm = F.normalize(centroids, dim=-1)
-    centroid_dists = 1.0 - (q_norm @ c_norm.T)
-    cluster_id = int(torch.argmin(centroid_dists, dim=1).item())
-    centroid_distance = float(centroid_dists[0, cluster_id].item())
-
-    selected = torch.nonzero(cluster_labels == cluster_id, as_tuple=False).flatten()
-    cluster_size = int(selected.numel())
-    fallback = cluster_size < max(1, int(min_cluster_size)) or cluster_size < int(k)
-
-    if not fallback and exclude_index is not None:
-        selected = selected[selected != int(exclude_index)]
-        fallback = int(selected.numel()) < int(k)
-
-    if fallback:
-        selected = torch.arange(mem_bank.size(0), device=mem_bank.device)
-        if exclude_index is not None and selected.numel() > 1:
-            selected = selected[selected != int(exclude_index)]
-
-    bank = mem_bank[selected]
-    if distance == "cosine":
-        d = 1.0 - (query @ bank.T)
-    else:
-        d = torch.cdist(query, bank)
-
-    k_eff = min(int(k), int(d.size(1)))
-    topk = torch.topk(d, k=k_eff, dim=1, largest=False).values
-    score = float(topk.mean().item())
-    debug = {
-        "cluster_id": cluster_id,
-        "cluster_size": cluster_size,
-        "centroid_distance": centroid_distance,
-        "fallback_global": fallback,
-        "k_used": k_eff,
-        "score": score,
-    }
-    return score, debug
+    return score_clustered_knn_impl(
+        query=query,
+        mem_bank=mem_bank,
+        cluster_labels=cluster_labels,
+        centroids=centroids,
+        k=k,
+        distance=distance,
+        min_cluster_size=min_cluster_size,
+        score_normalization=score_normalization,
+        cluster_stats=cluster_stats,
+        eps=eps,
+        exclude_index=exclude_index,
+    )
 
 
 def compute_clustered_threshold_and_mem_dists(
@@ -204,6 +181,9 @@ def compute_clustered_threshold_and_mem_dists(
     distance: str,
     pct: float,
     min_cluster_size: int,
+    score_normalization: str = "none",
+    cluster_stats: dict | None = None,
+    eps: float = 1e-6,
 ) -> tuple[float, np.ndarray]:
     mem_dists = []
     for i in tqdm(
@@ -221,6 +201,9 @@ def compute_clustered_threshold_and_mem_dists(
             k=k,
             distance=distance,
             min_cluster_size=min_cluster_size,
+            score_normalization=score_normalization,
+            cluster_stats=cluster_stats,
+            eps=eps,
             exclude_index=i,
         )
         mem_dists.append(score)
@@ -245,24 +228,32 @@ def print_final_active_pipeline(
     cfg: dict,
     pipeline_mode: str,
     memory_cfg: dict,
+    pca_cfg: dict,
     k: int,
     distance: str,
     threshold_method: str,
     threshold_percentile: float,
+    bank_path: Path | None = None,
 ) -> None:
     threshold_cfg = cfg.get("threshold", {})
     augmentation_enabled = bool(cfg.get("augmentation", {}).get("enabled", False))
     temporal_enabled = bool(cfg.get("detector", {}).get("temporal", {}).get("enabled", False))
     sweep_enabled = bool(threshold_cfg.get("sweep_enabled", False))
 
-    print("FINAL ACTIVE PIPELINE")
+    print("FINAL ATTEMPT CONFIG")
     print(f"- pipeline mode: {pipeline_mode}")
     print(f"- memory bank mode: {memory_cfg['mode']}")
-    print(f"- clusters: {memory_cfg['num_clusters']}")
+    print(f"- num clusters: {memory_cfg['num_clusters']}")
+    print(f"- score normalization mode: {memory_cfg['cluster_score_normalization']}")
+    print(f"- PCA whitening: {'enabled' if pca_cfg['enabled'] else 'disabled'}")
+    if pca_cfg["enabled"]:
+        print(f"- PCA components: {pca_cfg['n_components']}")
     print(f"- distance metric: {distance}")
     print(f"- kNN K: {k}")
     print(f"- threshold method: {threshold_method}")
     print(f"- threshold percentile: {_format_number(threshold_percentile)}")
+    if bank_path is not None:
+        print(f"- bank path: {bank_path}")
     print("- threshold tuning: disabled (unlabeled eval data)")
 
     non_final = [
@@ -334,6 +325,8 @@ def main():
     top_windows = get_top_windows(cfg, args.top_windows)
     memory_cfg = get_memory_bank_config(cfg)
     memory_mode = memory_cfg["mode"]
+    post_cfg = get_embedding_postprocess_config(cfg)
+    pca_cfg = post_cfg["pca_whitening"]
     validate_pipeline_memory_compatibility(pipeline_mode, memory_mode)
     aug_config = AugmentationConfig.from_config(cfg)
     set_augmentation_seed(aug_config.seed)
@@ -379,14 +372,27 @@ def main():
         and args.stage == "eval_data"
     ):
         print("Threshold sweep is disabled for AutoTrash because eval data is unlabeled.")
+    expected_bank_path = None
+    if args.machine:
+        expected_bank_path = get_bank_path(
+            bank_dir,
+            args.machine,
+            pipeline_mode,
+            memory_mode,
+            memory_cfg["num_clusters"],
+            memory_cfg["cluster_score_normalization"],
+            pca_cfg["n_components"] if pca_cfg["enabled"] else None,
+        )
     print_final_active_pipeline(
         cfg=cfg,
         pipeline_mode=pipeline_mode,
         memory_cfg=memory_cfg,
+        pca_cfg=pca_cfg,
         k=K,
         distance=distance,
         threshold_method=threshold_method,
         threshold_percentile=pct,
+        bank_path=expected_bank_path,
     )
     if distance == "cosine" and not normalize:
         print("⚠️  distance=cosine but model.normalize=false; forcing L2 normalization.")
@@ -399,6 +405,8 @@ def main():
     if memory_mode == "clustered":
         print(f"  scoring method: {memory_cfg['cluster_score_mode']}")
         print(f"  requested clusters: {memory_cfg['num_clusters']}")
+        print(f"  cluster_score_normalization: {memory_cfg['cluster_score_normalization']}")
+        print(f"  cluster_score_eps: {memory_cfg['cluster_score_eps']}")
         print(f"  min_cluster_size: {memory_cfg['min_cluster_size']}")
     else:
         print("  scoring method: global kNN")
@@ -460,6 +468,8 @@ def main():
             pipeline_mode,
             memory_mode,
             memory_cfg["num_clusters"],
+            memory_cfg["cluster_score_normalization"],
+            pca_cfg["n_components"] if pca_cfg["enabled"] else None,
         )
         legacy_paths = [p for p in get_legacy_bank_paths(bank_dir, machine, pipeline_mode) if p != bank_path]
 
@@ -469,6 +479,8 @@ def main():
             pipeline_mode,
             memory_mode,
             memory_cfg["num_clusters"],
+            memory_cfg["cluster_score_normalization"],
+            pca_cfg["n_components"] if pca_cfg["enabled"] else None,
         )
         stale_existing.extend([p for p in legacy_paths if p.exists()])
         stale_existing = sorted(set(stale_existing))
@@ -500,6 +512,9 @@ def main():
             meta,
             memory_mode,
             memory_cfg["num_clusters"],
+            cluster_score_normalization=memory_cfg["cluster_score_normalization"],
+            pca_enabled=pca_cfg["enabled"],
+            pca_n_components=pca_cfg["n_components"] if pca_cfg["enabled"] else None,
         )
         if not matches:
             rebuild_bank(machine, f"Memory bank {bank_path.name} is stale/mismatched: {reason}")
@@ -510,7 +525,11 @@ def main():
 
     def prepare_machine(machine: str):
         bank_path = ensure_bank(machine)
-        cache_key = f"{machine}__{pipeline_mode}__{memory_mode}__k{memory_cfg['num_clusters']}"
+        cache_key = (
+            f"{machine}__{pipeline_mode}__{memory_mode}__k{memory_cfg['num_clusters']}"
+            f"__norm_{memory_cfg['cluster_score_normalization']}"
+            f"__pca_{pca_cfg['n_components'] if pca_cfg['enabled'] else 'none'}"
+        )
         if cache_key in cache:
             return cache[cache_key]
 
@@ -519,6 +538,8 @@ def main():
         raw_paths = ckpt.get("paths", [""] * len(raw_mem))
         bank_aug_meta = ckpt.get("meta", {}).get("augmentation", {}) if isinstance(ckpt, dict) else {}
         meta = ckpt.get("meta", {}) if isinstance(ckpt, dict) else {}
+        pca_payload = ckpt.get("embedding_postprocess", {}).get("pca_whitening", {"enabled": False})
+        bank_pca_enabled = bool(pca_payload.get("enabled", False))
 
         # Allow entries as (D,), (1,D), etc.
         def to_vec(x: torch.Tensor) -> torch.Tensor:
@@ -540,7 +561,7 @@ def main():
             if not idxs:
                 idxs = idx_all
             bank = torch.stack([to_vec(raw_mem[i]) for i in idxs], dim=0).to(device)
-            if normalize:
+            if normalize and not bank_pca_enabled:
                 bank = F.normalize(bank, dim=-1)
             return bank
 
@@ -561,6 +582,9 @@ def main():
             memory_mode,
             memory_cfg["num_clusters"],
             feature_dim,
+            cluster_score_normalization=memory_cfg["cluster_score_normalization"],
+            pca_enabled=pca_cfg["enabled"],
+            pca_n_components=pca_cfg["n_components"] if pca_cfg["enabled"] else None,
         )
         if not matches:
             rebuild_bank(machine, f"Memory bank {bank_path.name} is stale/mismatched: {reason}")
@@ -574,8 +598,14 @@ def main():
                 return prepare_machine(machine)
             cluster_labels = ckpt["cluster_labels"].to(device=device, dtype=torch.long)
             centroids = ckpt["centroids"].to(device=device, dtype=mem_banks["__all__"].dtype)
-            if normalize:
+            if normalize and not bank_pca_enabled:
                 centroids = F.normalize(centroids, dim=-1)
+            cluster_stats = ckpt.get("cluster_score_stats")
+            if memory_cfg["cluster_score_normalization"] != "none" and not cluster_stats:
+                rebuild_bank(machine, f"Clustered bank {bank_path.name} is missing cluster_score_stats")
+                return prepare_machine(machine)
+        else:
+            cluster_stats = None
 
         print(
             f"▶ Preparing {machine} bank ({bank_path.name}): "
@@ -595,7 +625,15 @@ def main():
         if memory_mode == "clustered":
             print(
                 f"  clustered bank: clusters={centroids.size(0)}, "
-                f"score_mode={memory_cfg['cluster_score_mode']}, min_cluster_size={memory_cfg['min_cluster_size']}"
+                f"score_mode={memory_cfg['cluster_score_mode']}, "
+                f"score_normalization={memory_cfg['cluster_score_normalization']}, "
+                f"min_cluster_size={memory_cfg['min_cluster_size']}"
+            )
+        if bank_pca_enabled:
+            print(
+                "  PCA whitening: "
+                f"components={pca_payload.get('n_components')}, "
+                f"whiten={pca_payload.get('whiten')}, l2_after={pca_payload.get('l2_after')}"
             )
 
         # Unified threshold/stats: score uses both domains jointly.
@@ -612,6 +650,9 @@ def main():
                 distance=distance,
                 pct=pct,
                 min_cluster_size=memory_cfg["min_cluster_size"],
+                score_normalization=memory_cfg["cluster_score_normalization"],
+                cluster_stats=cluster_stats,
+                eps=memory_cfg["cluster_score_eps"],
             )
         else:
             thr, mem_dists = compute_threshold_and_mem_dists(
@@ -636,6 +677,8 @@ def main():
             "bank_path": str(bank_path),
             "cluster_labels": cluster_labels,
             "centroids": centroids,
+            "cluster_stats": cluster_stats,
+            "pca_payload": pca_payload,
         }
         return cache[cache_key]
 
@@ -689,12 +732,15 @@ def main():
             mu, sig = pack["dom_stats"]["__all__"]
             cluster_labels = pack.get("cluster_labels")
             centroids = pack.get("centroids")
+            cluster_stats = pack.get("cluster_stats")
+            pca_payload = pack.get("pca_payload")
 
             if pipeline_mode == "clip":
                 # backbone→embedding (1, D)
                 feat = backbone(wav, sr)
                 if normalize:
                     feat = F.normalize(feat, dim=-1)
+                feat = apply_pca_whitening_tensor(feat, pca_payload)
 
                 # GPU k‐NN scoring
                 if memory_mode == "clustered":
@@ -706,12 +752,16 @@ def main():
                         k=K,
                         distance=distance,
                         min_cluster_size=memory_cfg["min_cluster_size"],
+                        score_normalization=memory_cfg["cluster_score_normalization"],
+                        cluster_stats=cluster_stats,
+                        eps=memory_cfg["cluster_score_eps"],
                     )
                     if verbose_debug:
                         print(
                             f"DEBUG {p.name}: cluster={debug['cluster_id']} size={debug['cluster_size']} "
                             f"centroid_dist={debug['centroid_distance']:.6f} fallback={debug['fallback_global']} "
-                            f"score={debug['score']:.6f}"
+                            f"raw={debug['raw_score']:.6f} score={debug['score']:.6f} "
+                            f"norm={debug['score_normalization']}/{debug['normalization_source']}"
                         )
                     elif debug["fallback_global"] and machine not in clustered_fallback_warned:
                         print(
@@ -732,6 +782,7 @@ def main():
                 win_emb = make_window_embeddings(temporal, win_frames, hop_frames)  # (W,D)
                 if normalize:
                     win_emb = F.normalize(win_emb, dim=-1)
+                win_emb = apply_pca_whitening_tensor(win_emb, pca_payload)
 
                 if distance == "cosine":
                     d = 1.0 - (win_emb @ mem_bank.T)  # (W,N)
@@ -758,6 +809,7 @@ def main():
                         feat = backbone(wav_i, sr, spec_augment=mel_aug)
                         if normalize:
                             feat = F.normalize(feat, dim=-1)
+                        feat = apply_pca_whitening_tensor(feat, pca_payload)
 
                         if memory_mode == "clustered":
                             view_score, debug = score_clustered_knn(
@@ -768,12 +820,16 @@ def main():
                                 k=K,
                                 distance=distance,
                                 min_cluster_size=memory_cfg["min_cluster_size"],
+                                score_normalization=memory_cfg["cluster_score_normalization"],
+                                cluster_stats=cluster_stats,
+                                eps=memory_cfg["cluster_score_eps"],
                             )
                             if verbose_debug:
                                 print(
                                     f"DEBUG {p.name}: cluster={debug['cluster_id']} size={debug['cluster_size']} "
                                     f"centroid_dist={debug['centroid_distance']:.6f} fallback={debug['fallback_global']} "
-                                    f"score={debug['score']:.6f}"
+                                    f"raw={debug['raw_score']:.6f} score={debug['score']:.6f} "
+                                    f"norm={debug['score_normalization']}/{debug['normalization_source']}"
                                 )
                             elif debug["fallback_global"] and machine not in clustered_fallback_warned:
                                 print(
@@ -799,6 +855,7 @@ def main():
                         win_emb = make_window_embeddings(temporal, win_frames, hop_frames)
                         if normalize:
                             win_emb = F.normalize(win_emb, dim=-1)
+                        win_emb = apply_pca_whitening_tensor(win_emb, pca_payload)
 
                         if distance == "cosine":
                             d = 1.0 - (win_emb @ mem_bank.T)

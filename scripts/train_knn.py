@@ -31,6 +31,7 @@ from src.augmentations import (
 from src.pipeline import (
     describe_pipeline,
     get_bank_path,
+    get_embedding_postprocess_config,
     get_legacy_bank_paths,
     get_memory_bank_config,
     get_pipeline_mode,
@@ -38,6 +39,8 @@ from src.pipeline import (
     get_window_params,
     validate_pipeline_memory_compatibility,
 )
+from src.cluster_scoring import compute_cluster_score_stats
+from src.embedding_postprocess import fit_pca_whitening
 
 
 def collate(batch):
@@ -212,6 +215,8 @@ def main():
     win_frames, hop_frames = get_window_params(cfg, args.win_frames, args.hop_frames)
     memory_cfg = get_memory_bank_config(cfg)
     memory_mode = memory_cfg["mode"]
+    post_cfg = get_embedding_postprocess_config(cfg)
+    pca_cfg = post_cfg["pca_whitening"]
     validate_pipeline_memory_compatibility(pipeline_mode, memory_mode)
     aug_config = AugmentationConfig.from_config(cfg)
     seed = aug_config.seed
@@ -233,6 +238,8 @@ def main():
         pipeline_mode,
         memory_mode,
         memory_cfg["num_clusters"],
+        memory_cfg["cluster_score_normalization"],
+        pca_cfg["n_components"] if pca_cfg["enabled"] else None,
     )
 
     if args.machine is None and args.stage == "both":
@@ -277,6 +284,20 @@ def main():
         print("⚠️  distance=cosine but model.normalize=false; forcing L2 normalization.")
         normalize = True
 
+    threshold_percentile = float(cfg.get("threshold", {}).get("percentile", 90))
+    print("FINAL ATTEMPT CONFIG")
+    print(f"- pipeline mode: {pipeline_mode}")
+    print(f"- memory bank mode: {memory_mode}")
+    print(f"- num clusters: {memory_cfg['num_clusters']}")
+    print(f"- score normalization mode: {memory_cfg['cluster_score_normalization']}")
+    print(f"- PCA whitening: {'enabled' if pca_cfg['enabled'] else 'disabled'}")
+    if pca_cfg["enabled"]:
+        print(f"- PCA components: {pca_cfg['n_components']}")
+    print(f"- threshold percentile: {threshold_percentile:g}")
+    print(f"- distance metric: {distance}")
+    print(f"- kNN K: {k}")
+    print(f"- bank path: {out_path}")
+
     print(f"Detector: k={k}, distance={distance}, normalize={normalize}")
     print(f"Augmented memory mode: {aug_config.memory_mode}")
     for line in describe_pipeline(pipeline_mode, win_frames, hop_frames):
@@ -286,6 +307,8 @@ def main():
         print(f"  num_clusters: {memory_cfg['num_clusters']}")
         print(f"  cluster_method: {memory_cfg['cluster_method']}")
         print(f"  cluster_score_mode: {memory_cfg['cluster_score_mode']}")
+        print(f"  cluster_score_normalization: {memory_cfg['cluster_score_normalization']}")
+        print(f"  cluster_score_eps: {memory_cfg['cluster_score_eps']}")
         print(f"  min_cluster_size: {memory_cfg['min_cluster_size']}")
     print(f"  cleanup stale banks: {memory_cfg['cleanup_stale_banks']}")
     print(f"Bank output path: {out_path}")
@@ -376,6 +399,8 @@ def main():
             pipeline_mode,
             memory_mode,
             memory_cfg["num_clusters"],
+            memory_cfg["cluster_score_normalization"],
+            pca_cfg["n_components"] if pca_cfg["enabled"] else None,
         )
         stale_paths.extend(get_legacy_bank_paths(out_dir, args.machine, pipeline_mode))
         for stale_path in sorted(set(stale_paths)):
@@ -389,19 +414,42 @@ def main():
     cluster_payload = {}
     effective_clusters = None
     cluster_counts = None
+    pca_payload = {"enabled": False}
+    if pca_cfg["enabled"]:
+        matrix = torch.stack([_to_vec(f).detach().cpu() for f in feats], dim=0).float()
+        matrix, pca_payload = fit_pca_whitening(matrix, pca_cfg)
+        feats = [row.detach().cpu() for row in matrix]
+        print(
+            "PCA whitening fitted: "
+            f"requested={pca_payload['requested_n_components']}, "
+            f"effective={pca_payload['n_components']}, "
+            f"whiten={pca_payload['whiten']}, l2_after={pca_payload['l2_after']}"
+        )
+
     if memory_mode == "clustered":
         matrix, cluster_labels, centroids, effective_clusters, cluster_counts = build_kmeans_bank(
             feats=feats,
             requested_clusters=int(memory_cfg["num_clusters"]),
             min_cluster_size=int(memory_cfg["min_cluster_size"]),
             seed=seed,
-            normalize=normalize,
+            normalize=normalize and not pca_cfg["enabled"],
         )
         feats = [row.detach().cpu() for row in matrix]
+        cluster_score_stats = None
+        if memory_cfg["cluster_score_normalization"] != "none":
+            print("Computing cluster-local leave-one-out kNN distance statistics.")
+            cluster_score_stats = compute_cluster_score_stats(
+                mem_bank=matrix,
+                cluster_labels=cluster_labels,
+                k=int(k),
+                distance=distance,
+                min_cluster_size=int(memory_cfg["min_cluster_size"]),
+            )
         cluster_payload = {
             "cluster_labels": cluster_labels,
             "centroids": centroids,
             "cluster_counts": cluster_counts,
+            "cluster_score_stats": cluster_score_stats,
         }
 
     torch.save(
@@ -409,6 +457,9 @@ def main():
             "memory": feats,
             "paths": paths,
             **cluster_payload,
+            "embedding_postprocess": {
+                "pca_whitening": pca_payload,
+            },
             "meta": {
                 "machine": args.machine,
                 "stage": args.stage,
@@ -422,12 +473,26 @@ def main():
                 "requested_num_clusters": memory_cfg["num_clusters"] if memory_mode == "clustered" else None,
                 "cluster_method": memory_cfg["cluster_method"] if memory_mode == "clustered" else None,
                 "cluster_score_mode": memory_cfg["cluster_score_mode"] if memory_mode == "clustered" else None,
+                "cluster_score_normalization": (
+                    memory_cfg["cluster_score_normalization"] if memory_mode == "clustered" else "none"
+                ),
+                "cluster_score_eps": memory_cfg["cluster_score_eps"] if memory_mode == "clustered" else None,
                 "min_cluster_size": memory_cfg["min_cluster_size"] if memory_mode == "clustered" else None,
                 "cluster_counts": cluster_counts,
                 "distance": distance,
                 "k": k,
                 "embedding_model": cfg["model"].get("embedding"),
                 "feature_dim": int(_to_vec(feats[0]).numel()) if feats else None,
+                "embedding_postprocess": {
+                    "pca_whitening": {
+                        "enabled": bool(pca_payload.get("enabled", False)),
+                        "requested_n_components": pca_payload.get("requested_n_components"),
+                        "n_components": pca_payload.get("n_components"),
+                        "whiten": pca_payload.get("whiten"),
+                        "l2_after": pca_payload.get("l2_after"),
+                        "input_feature_dim": pca_payload.get("input_feature_dim"),
+                    }
+                },
                 "augmentation": {
                     "enabled": augmentation_enabled,
                     "num_views_train": augmentation_views,
