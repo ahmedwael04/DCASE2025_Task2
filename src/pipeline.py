@@ -9,6 +9,14 @@ from typing import Any
 VALID_PIPELINE_MODES = {"clip", "window"}
 VALID_MEMORY_BANK_MODES = {"plain", "clustered"}
 VALID_CLUSTER_SCORE_NORMALIZATION = {"none", "mean_ratio", "zscore", "robust_zscore"}
+VALID_EMBEDDING_MODES = {
+    "last_layer_mean",
+    "last_layer_cls",
+    "last_layer_mean_std",
+    "last4_layers_mean",
+    "middle_layer_mean",
+    "middle_layer_mean_std",
+}
 
 
 def get_pipeline_mode(cfg: dict[str, Any], override: str | None = None) -> str:
@@ -38,6 +46,19 @@ def get_top_windows(cfg: dict[str, Any], override: int | None = None) -> int:
     pipe = cfg.get("pipeline", {})
     value = int(override if override is not None else pipe.get("top_windows", 5))
     return max(1, value)
+
+
+def get_embedding_mode(cfg: dict[str, Any], override: str | None = None) -> str:
+    mode = override
+    if mode is None:
+        mode = cfg.get("EMBEDDING_MODE")
+    if mode is None:
+        mode = cfg.get("model", {}).get("embedding_mode", "last_layer_mean")
+    mode = str(mode).lower()
+    if mode not in VALID_EMBEDDING_MODES:
+        valid = ", ".join(sorted(VALID_EMBEDDING_MODES))
+        raise ValueError(f"model.embedding_mode must be one of: {valid}")
+    return mode
 
 
 def get_memory_bank_config(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -108,6 +129,7 @@ def get_bank_path(
     num_clusters: int | None = None,
     cluster_score_normalization: str = "none",
     pca_n_components: int | None = None,
+    embedding_mode: str | None = None,
 ) -> Path:
     """Return the canonical bank path for a machine/mode pair."""
     mode = get_pipeline_mode({}, mode)
@@ -117,6 +139,11 @@ def get_bank_path(
     validate_pipeline_memory_compatibility(mode, memory_mode)
 
     stem = "memory_bank" if machine is None else f"memory_bank_{machine}"
+    embedding_suffix = ""
+    if embedding_mode is not None:
+        embedding_mode = get_embedding_mode({"model": {"embedding_mode": embedding_mode}})
+        if embedding_mode != "last_layer_mean":
+            embedding_suffix = f"_emb_{embedding_mode}"
     if memory_mode == "clustered":
         k = max(1, int(num_clusters or 1))
         score_norm = str(cluster_score_normalization or "none").lower()
@@ -128,8 +155,9 @@ def get_bank_path(
             name += f"_norm_{score_norm}"
         if pca_n_components is not None:
             name += f"_pca{max(1, int(pca_n_components))}"
+        name += embedding_suffix
         return Path(bank_dir) / f"{name}.pt"
-    return Path(bank_dir) / f"{stem}_{mode}.pt"
+    return Path(bank_dir) / f"{stem}_{mode}{embedding_suffix}.pt"
 
 
 def get_legacy_bank_paths(bank_dir: str | Path, machine: str | None, mode: str | None = None) -> list[Path]:
@@ -177,6 +205,7 @@ def bank_matches_memory_config(
     cluster_score_normalization: str | None = None,
     pca_enabled: bool | None = None,
     pca_n_components: int | None = None,
+    embedding_mode: str | None = None,
 ) -> tuple[bool, str]:
     saved_mode = str(meta.get("memory_bank_mode", "plain")).lower()
     if saved_mode != memory_mode:
@@ -211,6 +240,15 @@ def bank_matches_memory_config(
             if saved_components is not None and int(saved_components) != int(pca_n_components):
                 return False, f"bank PCA components={saved_components}, requested PCA components={pca_n_components}"
 
+    if embedding_mode is not None:
+        saved_embedding_mode = str(meta.get("embedding_mode", "last_layer_mean")).lower()
+        requested_embedding_mode = get_embedding_mode({"model": {"embedding_mode": embedding_mode}})
+        if saved_embedding_mode != requested_embedding_mode:
+            return False, (
+                f"bank embedding_mode={saved_embedding_mode!r}, "
+                f"requested embedding_mode={requested_embedding_mode!r}"
+            )
+
     return True, "ok"
 
 
@@ -222,6 +260,7 @@ def get_stale_bank_paths(
     num_clusters: int | None = None,
     cluster_score_normalization: str = "none",
     pca_n_components: int | None = None,
+    embedding_mode: str | None = None,
 ) -> list[Path]:
     """Return same-machine bank files that can conflict with the active bank."""
     root = Path(bank_dir)
@@ -234,6 +273,7 @@ def get_stale_bank_paths(
         num_clusters,
         cluster_score_normalization,
         pca_n_components,
+        embedding_mode,
     )
 
     candidates = [

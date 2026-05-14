@@ -155,6 +155,7 @@ augmentation:
 # ------------------------------------------------------------------
 model:
   embedding: HUBERT_BASE          # built-in pipeline available in torchaudio 2.3
+  embedding_mode: last_layer_mean # BEATs hidden-state pooling variant
   pooling: mean                   # time-avg over frame-level embeddings
   normalize: true                 # L2-norm each embedding before k-NN
 

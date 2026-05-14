@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
 
 # Allow running as: python scripts/compute_dev_metrics.py
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +33,7 @@ from src.pipeline import (
     bank_matches_pipeline,
     describe_pipeline,
     get_bank_path,
+    get_embedding_mode,
     get_embedding_postprocess_config,
     get_memory_bank_config,
     get_pipeline_mode,
@@ -78,6 +79,7 @@ def score_clustered_knn(
     score_normalization: str = "none",
     cluster_stats: dict | None = None,
     eps: float = 1e-6,
+    exclude_index: int | None = None,
 ) -> float:
     score, _ = score_clustered_knn_impl(
         query=query,
@@ -90,6 +92,7 @@ def score_clustered_knn(
         score_normalization=score_normalization,
         cluster_stats=cluster_stats,
         eps=eps,
+        exclude_index=exclude_index,
     )
     return float(score)
 
@@ -114,9 +117,78 @@ def load_bank_checkpoint(bank_path: Path) -> dict:
     return ckpt
 
 
-def compute_metrics(cfg_path: str, machine_filter: str | None = None, return_results: bool = False):
+def compute_threshold_and_mem_dists(
+    mem_bank: torch.Tensor,
+    k: int,
+    distance: str,
+    pct: float,
+) -> tuple[float, np.ndarray]:
+    mem_dists = []
+    for i in range(mem_bank.size(0)):
+        query = mem_bank[i : i + 1]
+        if distance == "cosine":
+            d = 1.0 - (query @ mem_bank.T)
+        else:
+            d = torch.cdist(query, mem_bank)
+        d[0, i] = float("inf")
+        topk = torch.topk(d, k=k, dim=1, largest=False).values
+        mem_dists.append(float(topk.mean().item()))
+    mem_dists_np = np.asarray(mem_dists, dtype=np.float32)
+    return float(np.percentile(mem_dists_np, pct)), mem_dists_np
+
+
+def compute_clustered_threshold_and_mem_dists(
+    mem_bank: torch.Tensor,
+    cluster_labels: torch.Tensor,
+    centroids: torch.Tensor,
+    k: int,
+    distance: str,
+    pct: float,
+    min_cluster_size: int,
+    score_normalization: str = "none",
+    cluster_stats: dict | None = None,
+    eps: float = 1e-6,
+) -> tuple[float, np.ndarray]:
+    mem_dists = [
+        score_clustered_knn(
+            query=mem_bank[i : i + 1],
+            mem_bank=mem_bank,
+            cluster_labels=cluster_labels,
+            centroids=centroids,
+            k=k,
+            distance=distance,
+            min_cluster_size=min_cluster_size,
+            score_normalization=score_normalization,
+            cluster_stats=cluster_stats,
+            eps=eps,
+            exclude_index=i,
+        )
+        for i in range(mem_bank.size(0))
+    ]
+    mem_dists_np = np.asarray(mem_dists, dtype=np.float32)
+    return float(np.percentile(mem_dists_np, pct)), mem_dists_np
+
+
+def binary_metrics(y_true: list[int], scores: list[float], threshold: float) -> tuple[float, float, float]:
+    preds = (np.asarray(scores, dtype=np.float32) > float(threshold)).astype(np.int64)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        np.asarray(y_true, dtype=np.int64),
+        preds,
+        average="binary",
+        zero_division=0,
+    )
+    return float(precision * 100), float(recall * 100), float(f1 * 100)
+
+
+def compute_metrics(
+    cfg_path: str,
+    machine_filter: str | None = None,
+    return_results: bool = False,
+    embedding_mode_override: str | None = None,
+):
     # 1) load config, set up device
     cfg    = load_config(cfg_path)
+    embedding_mode = get_embedding_mode(cfg, embedding_mode_override)
     pipeline_mode = get_pipeline_mode(cfg)
     win_frames, hop_frames = get_window_params(cfg)
     top_windows = get_top_windows(cfg)
@@ -135,7 +207,7 @@ def compute_metrics(cfg_path: str, machine_filter: str | None = None, return_res
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # 2) load backbone & k-NN bank
-    backbone = BEATsBackbone(cfg["model"]["embedding"]).to(device).eval()
+    backbone = BEATsBackbone(cfg["model"]["embedding"], embedding_mode=embedding_mode).to(device).eval()
     augmentor = DomainGeneralizationAugmentor(aug_config, generator=aug_rng)
     test_aug_views = aug_config.num_views_test if aug_config.enabled else 0
     spec_augment_active = (
@@ -148,9 +220,10 @@ def compute_metrics(cfg_path: str, machine_filter: str | None = None, return_res
     distance = str(cfg.get("detector", {}).get("distance", "cosine")).lower()
     normalize = bool(cfg.get("model", {}).get("normalize", False))
     if distance == "cosine" and not normalize:
-        print("⚠️  distance=cosine but model.normalize=false; forcing L2 normalization.")
+        print("[WARN]  distance=cosine but model.normalize=false; forcing L2 normalization.")
         normalize = True
     print(f"Detector: k={k}, distance={distance}, normalize={normalize}")
+    print(f"Embedding mode: {embedding_mode}")
     for line in describe_pipeline(pipeline_mode, win_frames, hop_frames, top_windows):
         print(line)
     print(f"Memory bank mode: {memory_mode}")
@@ -175,6 +248,7 @@ def compute_metrics(cfg_path: str, machine_filter: str | None = None, return_res
             memory_cfg["num_clusters"],
             memory_cfg["cluster_score_normalization"],
             pca_cfg["n_components"] if pca_cfg["enabled"] else None,
+            embedding_mode,
         )
         if not bank_path.exists():
             raise RuntimeError(
@@ -213,6 +287,7 @@ def compute_metrics(cfg_path: str, machine_filter: str | None = None, return_res
             cluster_score_normalization=memory_cfg["cluster_score_normalization"],
             pca_enabled=pca_cfg["enabled"],
             pca_n_components=pca_cfg["n_components"] if pca_cfg["enabled"] else None,
+            embedding_mode=embedding_mode,
         )
         if not matches:
             raise RuntimeError(
@@ -235,10 +310,28 @@ def compute_metrics(cfg_path: str, machine_filter: str | None = None, return_res
         else:
             cluster_stats = None
 
+        threshold_percentile = float(cfg.get("threshold", {}).get("percentile", 90))
+        if memory_mode == "clustered":
+            threshold, _ = compute_clustered_threshold_and_mem_dists(
+                mem_bank=mem_bank,
+                cluster_labels=cluster_labels,
+                centroids=centroids,
+                k=k,
+                distance=distance,
+                pct=threshold_percentile,
+                min_cluster_size=memory_cfg["min_cluster_size"],
+                score_normalization=memory_cfg["cluster_score_normalization"],
+                cluster_stats=cluster_stats,
+                eps=memory_cfg["cluster_score_eps"],
+            )
+        else:
+            threshold, _ = compute_threshold_and_mem_dists(mem_bank, k, distance, threshold_percentile)
+
         print(
             f"Preparing dev metrics for {m}: bank={bank_path.name}, entries={mem_bank.size(0)}, "
             f"score_norm={memory_cfg['cluster_score_normalization']}, "
-            f"pca={'on' if bank_pca_enabled else 'off'}"
+            f"pca={'on' if bank_pca_enabled else 'off'}, "
+            f"threshold_p{threshold_percentile:g}={threshold:.6f}"
         )
 
         # gather all test clips for this machine
@@ -325,6 +418,8 @@ def compute_metrics(cfg_path: str, machine_filter: str | None = None, return_res
         auc_target = roc_auc_score(y_tgt, s_tgt) * 100
         # partial AUC at FPR<=0.1, normalized to [0,1], then *100
         pauc = roc_auc_score(y_tgt, s_tgt, max_fpr=0.1) * 100
+        precision_source, recall_source, f1_source = binary_metrics(y_src, s_src, threshold)
+        precision_target, recall_target, f1_target = binary_metrics(y_tgt, s_tgt, threshold)
         official_score = _harmonic_mean([auc_source / 100.0, auc_target / 100.0, pauc / 100.0]) * 100
 
         results[m] = {
@@ -332,6 +427,12 @@ def compute_metrics(cfg_path: str, machine_filter: str | None = None, return_res
             "auc_source": float(auc_source),
             "auc_target": float(auc_target),
             "pauc": float(pauc),
+            "precision_source": float(precision_source),
+            "precision_target": float(precision_target),
+            "recall_source": float(recall_source),
+            "recall_target": float(recall_target),
+            "f1_source": float(f1_source),
+            "f1_target": float(f1_target),
             "official_score": float(official_score),
         }
 
@@ -344,6 +445,12 @@ def compute_metrics(cfg_path: str, machine_filter: str | None = None, return_res
         print(f"      auc_source: {vals['auc_source']:.2f}")
         print(f"      auc_target: {vals['auc_target']:.2f}")
         print(f"      pauc: {vals['pauc']:.2f}")
+        print(f"      precision_source: {vals['precision_source']:.2f}")
+        print(f"      precision_target: {vals['precision_target']:.2f}")
+        print(f"      recall_source: {vals['recall_source']:.2f}")
+        print(f"      recall_target: {vals['recall_target']:.2f}")
+        print(f"      f1_source: {vals['f1_source']:.2f}")
+        print(f"      f1_target: {vals['f1_target']:.2f}")
         print(f"      official_score: {vals['official_score']:.2f}")
 
     if return_results:
@@ -358,5 +465,18 @@ if __name__ == "__main__":
         help="Path to your inference/training config"
     )
     ap.add_argument("--machine", default=None, help="Optional machine filter, e.g. AutoTrash")
+    ap.add_argument(
+        "--embedding-mode",
+        default=None,
+        choices=[
+            "last_layer_mean",
+            "last_layer_cls",
+            "last_layer_mean_std",
+            "last4_layers_mean",
+            "middle_layer_mean",
+            "middle_layer_mean_std",
+        ],
+        help="Override model.embedding_mode from config.",
+    )
     args = ap.parse_args()
-    compute_metrics(args.config, machine_filter=args.machine)
+    compute_metrics(args.config, machine_filter=args.machine, embedding_mode_override=args.embedding_mode)

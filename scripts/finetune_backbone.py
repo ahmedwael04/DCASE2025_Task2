@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Self‐supervised feature‐distillation fine‐tuning of HuBERT/BEATs.
-No mask‐param required—works with any torchaudio pipeline.
+No mask‐param required-works with any torchaudio pipeline.
 """
 
 import argparse
@@ -31,9 +31,9 @@ def main():
 
     # 2. paths & device
     data_root = cfg["data"]["root"]
-    print(f"▶ Fine‐tuning on data: {data_root}")
+    print(f"[INFO] Fine‐tuning on data: {data_root}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"▶ Using device: {device}")
+    print(f"[INFO] Using device: {device}")
 
     # 3. hyperparams (hard‐coded here)
     EPOCHS      = 5
@@ -86,7 +86,7 @@ def main():
 
     # 8. save student weights
     torch.save(student.state_dict(), "finetuned_beats_large.pt")
-    print("✅ Saved finetuned_beats_large.pt")
+    print("[OK] Saved finetuned_beats_large.pt")
 
 
 if __name__ == "__main__":

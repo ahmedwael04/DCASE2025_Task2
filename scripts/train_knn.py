@@ -31,6 +31,7 @@ from src.augmentations import (
 from src.pipeline import (
     describe_pipeline,
     get_bank_path,
+    get_embedding_mode,
     get_embedding_postprocess_config,
     get_legacy_bank_paths,
     get_memory_bank_config,
@@ -207,9 +208,23 @@ def main():
         choices=["dev_data", "eval_data", "both"],
         help="Which dataset stage to use for building the bank.",
     )
+    ap.add_argument(
+        "--embedding-mode",
+        default=None,
+        choices=[
+            "last_layer_mean",
+            "last_layer_cls",
+            "last_layer_mean_std",
+            "last4_layers_mean",
+            "middle_layer_mean",
+            "middle_layer_mean_std",
+        ],
+        help="Override model.embedding_mode from config.",
+    )
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    embedding_mode = get_embedding_mode(cfg, args.embedding_mode)
     pipeline_override = args.pipeline_mode or args.bank_level
     pipeline_mode = get_pipeline_mode(cfg, pipeline_override)
     win_frames, hop_frames = get_window_params(cfg, args.win_frames, args.hop_frames)
@@ -240,6 +255,7 @@ def main():
         memory_cfg["num_clusters"],
         memory_cfg["cluster_score_normalization"],
         pca_cfg["n_components"] if pca_cfg["enabled"] else None,
+        embedding_mode,
     )
 
     if args.machine is None and args.stage == "both":
@@ -259,6 +275,7 @@ def main():
     backbone = BEATsBackbone(
         checkpoint=cfg["model"]["embedding"],
         use_layer_stack=cfg["model"].get("use_layer_stack", False),
+        embedding_mode=embedding_mode,
     ).to(device).eval()
 
     augmentation_enabled = aug_config.enabled
@@ -281,7 +298,7 @@ def main():
     distance = str(cfg.get("detector", {}).get("distance", "cosine")).lower()
     normalize = bool(cfg.get("model", {}).get("normalize", False))
     if distance == "cosine" and not normalize:
-        print("⚠️  distance=cosine but model.normalize=false; forcing L2 normalization.")
+        print("[WARN]  distance=cosine but model.normalize=false; forcing L2 normalization.")
         normalize = True
 
     threshold_percentile = float(cfg.get("threshold", {}).get("percentile", 90))
@@ -290,6 +307,7 @@ def main():
     print(f"- memory bank mode: {memory_mode}")
     print(f"- num clusters: {memory_cfg['num_clusters']}")
     print(f"- score normalization mode: {memory_cfg['cluster_score_normalization']}")
+    print(f"- embedding mode: {embedding_mode}")
     print(f"- PCA whitening: {'enabled' if pca_cfg['enabled'] else 'disabled'}")
     if pca_cfg["enabled"]:
         print(f"- PCA components: {pca_cfg['n_components']}")
@@ -401,6 +419,7 @@ def main():
             memory_cfg["num_clusters"],
             memory_cfg["cluster_score_normalization"],
             pca_cfg["n_components"] if pca_cfg["enabled"] else None,
+            embedding_mode,
         )
         stale_paths.extend(get_legacy_bank_paths(out_dir, args.machine, pipeline_mode))
         for stale_path in sorted(set(stale_paths)):
@@ -482,6 +501,7 @@ def main():
                 "distance": distance,
                 "k": k,
                 "embedding_model": cfg["model"].get("embedding"),
+                "embedding_mode": embedding_mode,
                 "feature_dim": int(_to_vec(feats[0]).numel()) if feats else None,
                 "embedding_postprocess": {
                     "pca_whitening": {
@@ -506,7 +526,7 @@ def main():
         },
         out_path,
     )
-    print(f"✅ memory bank → {out_path}")
+    print(f"[OK] memory bank -> {out_path}")
     print(f"Memory bank size before augmentation: {clean_entries}")
     print(f"Memory bank size after augmentation:  {total_entries}")
     if memory_mode == "clustered":

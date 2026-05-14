@@ -3,13 +3,26 @@
 GPU-accelerated inference for DCASE-2025 Task 2 (eval set only).
 
 Produces:
-  • anomaly_score_<machine>_section_<XX>_test.csv
-  • decision_result_<machine>_section_<XX>_test.csv
+    - anomaly_score_<machine>_section_<XX>_test.csv
+    - decision_result_<machine>_section_<XX>_test.csv
 under your csv_out_dir (configs/default.yaml).
 """
 
 import argparse, sys, glob, subprocess
 from pathlib import Path
+
+
+def _configure_console_encoding() -> None:
+    """Best-effort: avoid UnicodeEncodeError on Windows consoles (cp1252)."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_configure_console_encoding()
 
 # Allow running as: python scripts/infer.py
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -36,6 +49,7 @@ from src.pipeline import (
     bank_matches_pipeline,
     describe_pipeline,
     get_bank_path,
+    get_embedding_mode,
     get_embedding_postprocess_config,
     get_legacy_bank_paths,
     get_memory_bank_config,
@@ -234,6 +248,7 @@ def print_final_active_pipeline(
     threshold_method: str,
     threshold_percentile: float,
     bank_path: Path | None = None,
+    embedding_mode: str = "last_layer_mean",
 ) -> None:
     threshold_cfg = cfg.get("threshold", {})
     augmentation_enabled = bool(cfg.get("augmentation", {}).get("enabled", False))
@@ -245,6 +260,7 @@ def print_final_active_pipeline(
     print(f"- memory bank mode: {memory_cfg['mode']}")
     print(f"- num clusters: {memory_cfg['num_clusters']}")
     print(f"- score normalization mode: {memory_cfg['cluster_score_normalization']}")
+    print(f"- embedding mode: {embedding_mode}")
     print(f"- PCA whitening: {'enabled' if pca_cfg['enabled'] else 'disabled'}")
     if pca_cfg["enabled"]:
         print(f"- PCA components: {pca_cfg['n_components']}")
@@ -317,8 +333,22 @@ def main():
         default=None,
         help="Aggregate by mean of top-N window scores when pipeline mode is window.",
     )
+    p.add_argument(
+        "--embedding-mode",
+        default=None,
+        choices=[
+            "last_layer_mean",
+            "last_layer_cls",
+            "last_layer_mean_std",
+            "last4_layers_mean",
+            "middle_layer_mean",
+            "middle_layer_mean_std",
+        ],
+        help="Override model.embedding_mode from config.",
+    )
     args   = p.parse_args()
     cfg    = load_config(args.config)
+    embedding_mode = get_embedding_mode(cfg, args.embedding_mode)
     pipeline_override = args.pipeline_mode or args.score_level
     pipeline_mode = get_pipeline_mode(cfg, pipeline_override)
     win_frames, hop_frames = get_window_params(cfg, args.win_frames, args.hop_frames)
@@ -340,10 +370,12 @@ def main():
     # 2) Paths
     bank_dir = Path(cfg["logging"]["bank_out"])
     csv_dir  = Path(cfg["logging"]["csv_out_dir"])
+    if bool(cfg.get("logging", {}).get("embedding_mode_subdirs", False)):
+        csv_dir = csv_dir / embedding_mode
     csv_dir.mkdir(parents=True, exist_ok=True)
 
     # 3) Load backbone
-    backbone = BEATsBackbone(cfg["model"]["embedding"]).to(device).eval()
+    backbone = BEATsBackbone(cfg["model"]["embedding"], embedding_mode=embedding_mode).to(device).eval()
     augmentor = DomainGeneralizationAugmentor(aug_config, generator=aug_rng)
     test_aug_views = aug_config.num_views_test if aug_config.enabled else 0
     spec_augment_active = (
@@ -382,6 +414,7 @@ def main():
             memory_cfg["num_clusters"],
             memory_cfg["cluster_score_normalization"],
             pca_cfg["n_components"] if pca_cfg["enabled"] else None,
+            embedding_mode,
         )
     print_final_active_pipeline(
         cfg=cfg,
@@ -393,9 +426,10 @@ def main():
         threshold_method=threshold_method,
         threshold_percentile=pct,
         bank_path=expected_bank_path,
+        embedding_mode=embedding_mode,
     )
     if distance == "cosine" and not normalize:
-        print("⚠️  distance=cosine but model.normalize=false; forcing L2 normalization.")
+        print("[WARN]  distance=cosine but model.normalize=false; forcing L2 normalization.")
         normalize = True
     print(f"Detector: k={K}, distance={distance}, normalize={normalize}")
     print(f"Test-time augmentation views: {test_aug_views}, aggregation={aug_config.test_score_agg}")
@@ -454,6 +488,8 @@ def main():
             "both",
             "--pipeline-mode",
             pipeline_mode,
+            "--embedding-mode",
+            embedding_mode,
             "--win-frames",
             str(win_frames),
             "--hop-frames",
@@ -470,6 +506,7 @@ def main():
             memory_cfg["num_clusters"],
             memory_cfg["cluster_score_normalization"],
             pca_cfg["n_components"] if pca_cfg["enabled"] else None,
+            embedding_mode,
         )
         legacy_paths = [p for p in get_legacy_bank_paths(bank_dir, machine, pipeline_mode) if p != bank_path]
 
@@ -481,6 +518,7 @@ def main():
             memory_cfg["num_clusters"],
             memory_cfg["cluster_score_normalization"],
             pca_cfg["n_components"] if pca_cfg["enabled"] else None,
+            embedding_mode,
         )
         stale_existing.extend([p for p in legacy_paths if p.exists()])
         stale_existing = sorted(set(stale_existing))
@@ -515,6 +553,7 @@ def main():
             cluster_score_normalization=memory_cfg["cluster_score_normalization"],
             pca_enabled=pca_cfg["enabled"],
             pca_n_components=pca_cfg["n_components"] if pca_cfg["enabled"] else None,
+            embedding_mode=embedding_mode,
         )
         if not matches:
             rebuild_bank(machine, f"Memory bank {bank_path.name} is stale/mismatched: {reason}")
@@ -529,6 +568,7 @@ def main():
             f"{machine}__{pipeline_mode}__{memory_mode}__k{memory_cfg['num_clusters']}"
             f"__norm_{memory_cfg['cluster_score_normalization']}"
             f"__pca_{pca_cfg['n_components'] if pca_cfg['enabled'] else 'none'}"
+            f"__emb_{embedding_mode}"
         )
         if cache_key in cache:
             return cache[cache_key]
@@ -585,6 +625,7 @@ def main():
             cluster_score_normalization=memory_cfg["cluster_score_normalization"],
             pca_enabled=pca_cfg["enabled"],
             pca_n_components=pca_cfg["n_components"] if pca_cfg["enabled"] else None,
+            embedding_mode=embedding_mode,
         )
         if not matches:
             rebuild_bank(machine, f"Memory bank {bank_path.name} is stale/mismatched: {reason}")
@@ -608,7 +649,7 @@ def main():
             cluster_stats = None
 
         print(
-            f"▶ Preparing {machine} bank ({bank_path.name}): "
+            f"[INFO] Preparing {machine} bank ({bank_path.name}): "
             f"source={mem_banks['counts']['source']}, target={mem_banks['counts']['target']}, all={mem_banks['counts']['__all__']}"
         )
 
@@ -640,7 +681,7 @@ def main():
         thresholds: dict[str, float] = {}
         dom_stats: dict[str, tuple[float, float]] = {}
 
-        print(f"▶ Computing unified threshold for {machine} (__all__) …")
+        print(f"[INFO] Computing unified threshold for {machine} (__all__) …")
         if memory_mode == "clustered":
             thr, mem_dists = compute_clustered_threshold_and_mem_dists(
                 mem_bank=mem_banks["__all__"],
@@ -689,9 +730,9 @@ def main():
     else:
         pattern = f"{root}/{args.stage}/raw/*/test/**/*.wav"
     wavs    = sorted(glob.glob(pattern, recursive=True))
-    print(f"▶ Found {len(wavs)} test clips under: {pattern}")
+    print(f"[INFO] Found {len(wavs)} test clips under: {pattern}")
     if not wavs:
-        print("⚠️  No test files found for this stage/machine.")
+        print("[WARN]  No test files found for this stage/machine.")
         sys.exit(1)
 
     def machine_from_path(path: Path) -> str:
@@ -736,7 +777,7 @@ def main():
             pca_payload = pack.get("pca_payload")
 
             if pipeline_mode == "clip":
-                # backbone→embedding (1, D)
+                # backbone->embedding (1, D)
                 feat = backbone(wav, sr)
                 if normalize:
                     feat = F.normalize(feat, dim=-1)
@@ -876,7 +917,7 @@ def main():
             thr_n = (float(threshold) - float(mu)) / float(sig)
             decision = 1 if score_n > thr_n else 0
 
-            section = p.stem.split("_")[1]  # "section_XX_####" → ["section","XX","####"]
+            section = p.stem.split("_")[1]  # "section_XX_####" -> ["section","XX","####"]
             tag = f"{machine}_section_{section}"
 
             # open CSVs on first use
@@ -898,7 +939,7 @@ def main():
             finally:
                 dec_fp.close()
 
-    print(f"✅ All CSVs written to {csv_dir}/")
+    print(f"[OK] All CSVs written to {csv_dir}/")
 
 
 if __name__ == "__main__":
