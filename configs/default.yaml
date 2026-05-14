@@ -19,11 +19,26 @@ train:
   num_workers: 2       # same as dataloader.num_workers
 
 # ------------------------------------------------------------------
+# FINALIZED PIPELINE: AutoTrash
+# ------------------------------------------------------------------
+# The finalized AutoTrash pipeline is clip-level scoring. In testing,
+# the clip pipeline outperformed the window pipeline, so window mode is
+# disabled by default.
+#
+# The clustered memory bank with k=6 clusters gave the best official
+# score among tested cluster counts.
+#
+# The decision threshold is a fixed unsupervised 90th percentile of the
+# memory-bank distance distribution. AutoTrash currently has anonymized
+# unlabeled eval_data, so threshold tuning on eval labels is not valid.
+
+# ------------------------------------------------------------------
 # Pipeline mode
 # ------------------------------------------------------------------
 pipeline:
   # clip: one embedding per clip, clip bank, clip scoring.
   # window: window embeddings in the bank, window scoring with top-N aggregation.
+  # Final AutoTrash default: clip. Window scoring is experimental.
   mode: clip
   win_frames: 50
   hop_frames: 50
@@ -90,15 +105,15 @@ detector:
   k: 3                            # k-nearest neighbours
   distance: cosine
   temporal:
-    enabled: false                 # true = frame-level kNN + temporal aggregation
+    enabled: false                 # window/temporal scoring disabled by default
     aggregation: p95               # max | p95 | mean
     percentile: 95                 # used when aggregation=p95
     frame_stride: 1                # >1 subsamples frames to speed up
 
 threshold:
   method: percentile
-  percentile: 90                   # decision threshold percentile
-  sweep_enabled: false
+  percentile: 90                   # fixed unsupervised threshold percentile
+  sweep_enabled: false             # disabled for unlabeled AutoTrash eval_data
   sweep_values: [80, 85, 90, 92.5, 95]
   train_samples: 200               # used only when detector.temporal.enabled=true
 

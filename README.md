@@ -79,6 +79,21 @@ Key options:
 
 ---
 
+## Final AutoTrash Pipeline
+
+Final AutoTrash findings:
+
+* window scoring reduced target AUC
+* train-only augmentation had minimal impact
+* clustered memory bank improved the official score
+* k=6 was the best cluster count tested
+* fixed 90th percentile threshold is used because labels are unavailable
+
+The finalized config uses `pipeline.mode=clip`, `memory_bank.mode=clustered`,
+`memory_bank.num_clusters=6`, and `threshold.percentile=90`.
+
+---
+
 ## Citing / acknowledgements
 
 * BEATs: Chen **et al.** “BEATs: Audio Pre‑Training with Acoustic Tokenizers”, *ICML 2023*  

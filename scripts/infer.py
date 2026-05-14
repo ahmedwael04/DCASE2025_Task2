@@ -229,6 +229,58 @@ def compute_clustered_threshold_and_mem_dists(
     threshold = float(np.percentile(mem_dists_np, pct))
     return threshold, mem_dists_np
 
+
+def _format_number(value) -> str:
+    value_f = float(value)
+    if value_f.is_integer():
+        return str(int(value_f))
+    return str(value_f)
+
+
+def _is_autotrash(machine: str | None) -> bool:
+    return machine is not None and str(machine).lower() == "autotrash"
+
+
+def print_final_active_pipeline(
+    cfg: dict,
+    pipeline_mode: str,
+    memory_cfg: dict,
+    k: int,
+    distance: str,
+    threshold_method: str,
+    threshold_percentile: float,
+) -> None:
+    threshold_cfg = cfg.get("threshold", {})
+    augmentation_enabled = bool(cfg.get("augmentation", {}).get("enabled", False))
+    temporal_enabled = bool(cfg.get("detector", {}).get("temporal", {}).get("enabled", False))
+    sweep_enabled = bool(threshold_cfg.get("sweep_enabled", False))
+
+    print("FINAL ACTIVE PIPELINE")
+    print(f"- pipeline mode: {pipeline_mode}")
+    print(f"- memory bank mode: {memory_cfg['mode']}")
+    print(f"- clusters: {memory_cfg['num_clusters']}")
+    print(f"- distance metric: {distance}")
+    print(f"- kNN K: {k}")
+    print(f"- threshold method: {threshold_method}")
+    print(f"- threshold percentile: {_format_number(threshold_percentile)}")
+    print("- threshold tuning: disabled (unlabeled eval data)")
+
+    non_final = [
+        pipeline_mode != "clip",
+        memory_cfg["mode"] != "clustered",
+        int(memory_cfg["num_clusters"]) != 6,
+        str(distance).lower() != "cosine",
+        int(k) != 3,
+        str(threshold_method).lower() != "percentile",
+        float(threshold_percentile) != 90.0,
+        sweep_enabled,
+        augmentation_enabled,
+        temporal_enabled,
+    ]
+    if any(non_final):
+        print("WARNING: Running non-final experimental configuration.")
+
+
 def main():
     # 1) Argparse & config
     p = argparse.ArgumentParser()
@@ -318,6 +370,24 @@ def main():
     K = cfg.get("detector", {}).get("k", cfg.get("model", {}).get("k", 3))
     distance = str(cfg.get("detector", {}).get("distance", "cosine")).lower()
     normalize = bool(cfg.get("model", {}).get("normalize", False))
+    threshold_cfg = cfg.get("threshold", {})
+    threshold_method = str(threshold_cfg.get("method", "percentile")).lower()
+    pct = float(threshold_cfg.get("percentile", 90))
+    if (
+        bool(threshold_cfg.get("sweep_enabled", False))
+        and _is_autotrash(args.machine)
+        and args.stage == "eval_data"
+    ):
+        print("Threshold sweep is disabled for AutoTrash because eval data is unlabeled.")
+    print_final_active_pipeline(
+        cfg=cfg,
+        pipeline_mode=pipeline_mode,
+        memory_cfg=memory_cfg,
+        k=K,
+        distance=distance,
+        threshold_method=threshold_method,
+        threshold_percentile=pct,
+    )
     if distance == "cosine" and not normalize:
         print("⚠️  distance=cosine but model.normalize=false; forcing L2 normalization.")
         normalize = True
@@ -332,7 +402,6 @@ def main():
         print(f"  min_cluster_size: {memory_cfg['min_cluster_size']}")
     else:
         print("  scoring method: global kNN")
-    pct = cfg.get("threshold", {}).get("percentile", 90)
     chunk = 1024  # adjust to fit your GPU
     verbose_debug = str(cfg.get("logging", {}).get("level", "info")).lower() == "debug"
 

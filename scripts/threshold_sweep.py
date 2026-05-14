@@ -137,7 +137,10 @@ def find_machine_test_wavs(cfg: dict, machine: str, allow_unlabeled_eval: bool) 
         directory = eval_machine_dir / "test"
         wavs = sorted(glob.glob(str(directory / "**" / "*.wav"), recursive=True))
         if wavs:
-            print("Unlabeled eval data cannot be used for threshold optimization.")
+            if machine.lower() == "autotrash":
+                print("Threshold sweep is disabled for AutoTrash because eval data is unlabeled.")
+            else:
+                print("Unlabeled eval data cannot be used for threshold optimization.")
             return wavs, "eval_data", False
 
     searched = [

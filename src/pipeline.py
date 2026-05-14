@@ -70,8 +70,7 @@ def get_memory_bank_config(cfg: dict[str, Any]) -> dict[str, Any]:
 def validate_pipeline_memory_compatibility(pipeline_mode: str, memory_mode: str) -> None:
     if pipeline_mode == "window" and memory_mode == "clustered":
         raise ValueError(
-            "Clustered memory bank only supports clip pipeline mode. "
-            "Set pipeline.mode=clip or memory_bank.mode=plain."
+            "Window pipeline is experimental and not part of the finalized AutoTrash configuration."
         )
 
 
